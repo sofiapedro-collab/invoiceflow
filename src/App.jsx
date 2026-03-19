@@ -1,5 +1,24 @@
 import { useState, useRef, useEffect } from "react";
 
+const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhweWNxZWdvZ2txc29kdnlrcWZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5NTUxMTcsImV4cCI6MjA4OTUzMTExN30.Rb5r_9gsNNVIl0e9dqYraYJdDayvunqEMfQ_I8FmfKI";
+
+async function loadFromSupabase() {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.main&select=data`, {
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` }
+  });
+  const rows = await res.json();
+  return rows?.[0]?.data || null;
+}
+
+async function saveToSupabase(data) {
+  await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.main`, {
+    method: "PATCH",
+    headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ data, updated_at: new Date().toISOString() })
+  });
+}
+
 function fmt(n) { return "$" + Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2 }); }
 
 const DEPT_DEFAULT_LEADS = { "fiat finance": "Kaley", "uncovered": "Nick" };
@@ -62,7 +81,7 @@ function DroppedClients({ clients, currentMonthLabel, nextMonthLabel }) {
   );
 }
 
-function InvoiceApprovals({ invoices, setInvoices, currentMonthLabel, nextMonthLabel, qboConnected, setShowApprove, setApproveComment, setShowInvoiceDetail }) {
+function InvoiceApprovals({ invoices, setInvoices, currentMonthLabel, nextMonthLabel, qboConnected, setShowApprove, setApproveComment, setShowInvoiceDetail, onSaveInvoices }) {
   const [filterLead, setFilterLead] = useState("all");
   const base = invoices.filter(inv => inv.nextAmount > 0);
   const leads = ["all", ...new Set(base.map(inv => inv.lead).filter(Boolean))];
@@ -142,12 +161,12 @@ function InvoiceApprovals({ invoices, setInvoices, currentMonthLabel, nextMonthL
                             className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700 transition-colors">Review</button>
                         )}
                         {inv.status === "approved" && qboConnected && (
-                          <button onClick={() => setInvoices(p => p.map(i => i.id === inv.id ? { ...i, status: "sent" } : i))}
+                          <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "sent" } : i); setInvoices(u); await onSaveInvoices(u); }}
                             className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 transition-colors">Send via QBO</button>
                         )}
                         {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
                         {inv.status === "rejected" && (
-                          <button onClick={() => setInvoices(p => p.map(i => i.id === inv.id ? { ...i, status: "pending", comment: "" } : i))}
+                          <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "pending", comment: "" } : i); setInvoices(u); await onSaveInvoices(u); }}
                             className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50 transition-colors">Resubmit</button>
                         )}
                       </div>
@@ -185,10 +204,6 @@ function getMonthCols(headers) {
   return headers.map((h, i) => ({ h, i, d: parseColDate(h) })).filter(x => x.d).sort((a, b) => a.d - b.d);
 }
 
-async function persistData(data) {
-  try { await window.storage.set("invoiceflow_data", JSON.stringify(data)); } catch (_) {}
-}
-
 export default function App() {
   const [storageLoading, setStorageLoading] = useState(true);
   const [tab, setTab] = useState("dashboard");
@@ -214,6 +229,7 @@ export default function App() {
   const [approveComment, setApproveComment] = useState("");
   const [qboConnected, setQboConnected] = useState(false);
   const [qboSyncing, setQboSyncing] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   const [aiMessages, setAiMessages] = useState([{ role: "assistant", content: "Hi! Import your data from Google Sheets and then ask me anything about your clients, invoices, or monthly performance." }]);
   const [aiInput, setAiInput] = useState("");
@@ -222,11 +238,10 @@ export default function App() {
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [aiMessages]);
 
   useEffect(() => {
-    async function loadSaved() {
+    async function load() {
       try {
-        const res = await window.storage.get("invoiceflow_data");
-        if (res?.value) {
-          const d = JSON.parse(res.value);
+        const d = await loadFromSupabase();
+        if (d && d.clients?.length) {
           setRawRows(d.rawRows || []);
           setClients(d.clients || []);
           setApprovers(d.approvers || []);
@@ -237,13 +252,19 @@ export default function App() {
           setNextMonthLabel(d.nextMonthLabel || "");
           setSelectedMonth(d.selectedMonth || "");
           setConnected(true);
-          setAiMessages([{ role: "assistant", content: `Datos restaurados: ${(d.clients || []).length} clientes. ¡Preguntame lo que quieras!` }]);
+          setAiMessages([{ role: "assistant", content: `Datos cargados: ${(d.clients || []).length} clientes. ¡Preguntame lo que quieras!` }]);
         }
       } catch (_) {}
       setStorageLoading(false);
     }
-    loadSaved();
+    load();
   }, []);
+
+  async function saveAll(data) {
+    setSaving(true);
+    try { await saveToSupabase(data); } catch (_) {}
+    setSaving(false);
+  }
 
   async function processImport() {
     setImportError("");
@@ -282,7 +303,6 @@ export default function App() {
       }
 
       const resolveLead = (name, dept) => leadMap[name?.toLowerCase()] || getDefaultLead(dept) || "";
-
       const enriched = objects.filter(r => r[nameKey]?.trim()).map((r, i) => {
         const dept = deptKey ? (r[deptKey] || "") : "";
         return { _id: i, clientName: r[nameKey].trim(), service: serviceKey ? (r[serviceKey] || "") : "", department: dept, lead: resolveLead(r[nameKey].trim(), dept), amounts: Object.fromEntries(cols.map(c => [c.h, parseAmount(r[c.h])])) };
@@ -308,21 +328,14 @@ export default function App() {
         lines: c.lines, multiDept: c.multiDept,
       }));
 
-      setRawRows(enriched);
-      setClients(clientList);
-      setApprovers(approverNames);
-      setInvoices(invoiceList);
-      setMonthCols(cols);
-      setCurrentMonthLabel(curLabel);
-      setLastMonthLabel(prevLabel);
-      setNextMonthLabel(nextLabel);
-      setSelectedMonth(curCol.h);
-      setConnected(true);
-      setShowImport(false);
-      setClientPaste(""); setLeadPaste(""); setImportStep("clients");
+      setRawRows(enriched); setClients(clientList); setApprovers(approverNames);
+      setInvoices(invoiceList); setMonthCols(cols);
+      setCurrentMonthLabel(curLabel); setLastMonthLabel(prevLabel); setNextMonthLabel(nextLabel);
+      setSelectedMonth(curCol.h); setConnected(true);
+      setShowImport(false); setClientPaste(""); setLeadPaste(""); setImportStep("clients");
       setAiMessages([{ role: "assistant", content: `Synced ${clientList.length} clients with ${enriched.length} service lines. Ask me anything!` }]);
 
-      await persistData({ rawRows: enriched, clients: clientList, approvers: approverNames, invoices: invoiceList, monthCols: cols, currentMonthLabel: curLabel, lastMonthLabel: prevLabel, nextMonthLabel: nextLabel, selectedMonth: curCol.h });
+      await saveAll({ rawRows: enriched, clients: clientList, approvers: approverNames, invoices: invoiceList, monthCols: cols, currentMonthLabel: curLabel, lastMonthLabel: prevLabel, nextMonthLabel: nextLabel, selectedMonth: curCol.h });
     } catch (e) { setImportError(e.message); }
   }
 
@@ -330,7 +343,13 @@ export default function App() {
     const updated = invoices.map(i => i.id === showApprove.id ? { ...i, status: decision, comment: approveComment } : i);
     setInvoices(updated);
     setApproveComment(""); setShowApprove(null);
-    try { const saved = await window.storage.get("invoiceflow_data"); if (saved?.value) { const d = JSON.parse(saved.value); await persistData({ ...d, invoices: updated }); } } catch (_) {}
+    const saved = await loadFromSupabase();
+    if (saved) await saveToSupabase({ ...saved, invoices: updated });
+  }
+
+  async function handleSaveInvoices(updated) {
+    const saved = await loadFromSupabase();
+    if (saved) await saveToSupabase({ ...saved, invoices: updated });
   }
 
   const activeClients = clients.filter(c => c.status === "active");
@@ -378,6 +397,7 @@ Answer concisely in English. Use USD formatting.`;
           <p className="text-xs text-gray-400">Service Business Dashboard</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
+          {saving && <span className="text-xs text-gray-400">Guardando...</span>}
           <button onClick={() => { setShowImport(true); setImportStep("clients"); setImportError(""); }}
             className={`px-4 py-2 rounded-lg text-sm font-medium border transition-all ${connected ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-gray-900 bg-gray-900 text-white hover:bg-gray-700"}`}>
             {connected ? `Synced: ${clients.length} clients — Re-import` : "Import from Sheet"}
@@ -578,9 +598,9 @@ Answer concisely in English. Use USD formatting.`;
                           <td className="px-6 py-3 text-right">
                             <div className="flex gap-2 justify-end">
                               {inv.status === "pending" && <button onClick={() => { setShowApprove(inv); setApproveComment(""); }} className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700 transition-colors">Review</button>}
-                              {inv.status === "approved" && qboConnected && <button onClick={() => setInvoices(p => p.map(i => i.id === inv.id ? { ...i, status: "sent" } : i))} className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 transition-colors">Send via QBO</button>}
+                              {inv.status === "approved" && qboConnected && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "sent" } : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 transition-colors">Send via QBO</button>}
                               {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
-                              {inv.status === "rejected" && <button onClick={() => setInvoices(p => p.map(i => i.id === inv.id ? { ...i, status: "pending", comment: "" } : i))} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50 transition-colors">Resubmit</button>}
+                              {inv.status === "rejected" && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "pending", comment: "" } : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50 transition-colors">Resubmit</button>}
                             </div>
                           </td>
                         </tr>
@@ -601,6 +621,7 @@ Answer concisely in English. Use USD formatting.`;
             qboConnected={qboConnected}
             setShowApprove={setShowApprove} setApproveComment={setApproveComment}
             setShowInvoiceDetail={setShowInvoiceDetail}
+            onSaveInvoices={handleSaveInvoices}
           />
         )}
 
@@ -647,7 +668,6 @@ Answer concisely in English. Use USD formatting.`;
                   <p>2. Click on cell <strong>D1</strong> (Client Name header)</p>
                   <p>3. Select all data from D1 to the last column and row with data</p>
                   <p>4. Copy (Ctrl+C / Cmd+C) and paste below</p>
-                  <p className="text-blue-500">The app auto-detects month columns and groups rows by client.</p>
                 </div>
                 <textarea value={clientPaste} onChange={e => setClientPaste(e.target.value)}
                   placeholder={"Client Name\tService\tDepartment\t01/01/2025\t02/01/2025\nAcme Corp\tPaid\tCore Growth\t4500\t5000"}
@@ -665,7 +685,6 @@ Answer concisely in English. Use USD formatting.`;
                   <p>1. Open the <strong>Leads</strong> tab</p>
                   <p>2. Select all data including headers (<strong>Client</strong> and <strong>Lead</strong> columns)</p>
                   <p>3. Copy and paste below</p>
-                  <p className="text-blue-500">If a client has no lead, defaults apply: Fiat Finance = Kaley, Uncovered = Nick.</p>
                 </div>
                 <textarea value={leadPaste} onChange={e => setLeadPaste(e.target.value)}
                   placeholder={"Client\tLead\nAcme Corp\tSarah Johnson\nBlueSky LLC\tMike Torres"}
