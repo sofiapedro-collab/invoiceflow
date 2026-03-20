@@ -398,6 +398,27 @@ Answer concisely in English. Use USD formatting.`;
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {saving && <span className="text-xs text-gray-400">Guardando...</span>}
+          {invoices.filter(i => i.status === "approved").length > 0 && (
+            <button onClick={() => {
+              const approved = invoices.filter(i => i.status === "approved");
+              const rows = [["Client", "Lead", "Department", "Service", "Month", "Amount"]];
+              approved.forEach(inv => {
+                const lines = inv.lines?.filter(l => (l.amounts[inv.monthCol] || 0) > 0) || [];
+                if (lines.length === 0) {
+                  rows.push([inv.clientName, inv.lead, "", "", inv.month, inv.amount]);
+                } else {
+                  lines.forEach(l => rows.push([inv.clientName, inv.lead, l.department, l.service, inv.month, l.amounts[inv.monthCol]]));
+                }
+              });
+              const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+              a.download = `invoices-approved-${currentMonthLabel.replace(" ", "-")}.csv`;
+              a.click();
+            }} className="px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
+              Export Approved CSV
+            </button>
+          )}
           <button onClick={() => { setShowImport(true); setImportStep("clients"); setImportError(""); }}
             className={`px-4 py-2 rounded-lg text-sm font-medium border transition-all ${connected ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-gray-900 bg-gray-900 text-white hover:bg-gray-700"}`}>
             {connected ? `Synced: ${clients.length} clients — Re-import` : "Import from Sheet"}
