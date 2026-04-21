@@ -458,9 +458,9 @@ Answer concisely in English. Use USD formatting.`;
           <div className="space-y-6">
             <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
               {[
-                { label: `Projected — ${currentMonthLabel || "this month"}`, value: fmt(totalProjected), sub: `${activeClients.length} active clients` },
+                { label: `Projected — ${nextMonthLabel || "next month"}`, value: fmt(activeClients.reduce((s, c) => s + c.nextAmount, 0)), sub: `${activeClients.length} active clients` },
                 { label: `Invoiced — ${lastMonthLabel || "last month"}`, value: fmt(totalLast), sub: "actual billed" },
-                { label: "Month-over-Month", value: (totalProjected - totalLast >= 0 ? "+" : "") + fmt(totalProjected - totalLast), sub: totalProjected >= totalLast ? "increase" : "decrease", color: totalProjected >= totalLast ? "text-emerald-600" : "text-red-500" },
+                { label: "Month-over-Month", value: (activeClients.reduce((s, c) => s + c.nextAmount, 0) - totalLast >= 0 ? "+" : "") + fmt(activeClients.reduce((s, c) => s + c.nextAmount, 0) - totalLast), sub: activeClients.reduce((s, c) => s + c.nextAmount, 0) >= totalLast ? "increase" : "decrease", color: activeClients.reduce((s, c) => s + c.nextAmount, 0) >= totalLast ? "text-emerald-600" : "text-red-500" },
                 { label: "Pending Approval", value: pendingCount, sub: `${approvedCount} approved` },
               ].map(c => (
                 <div key={c.label} className="bg-white rounded-2xl p-5 border border-gray-100">
