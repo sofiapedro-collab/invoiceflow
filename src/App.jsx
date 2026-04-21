@@ -20,11 +20,12 @@ async function saveToSupabase(data) {
 }
 
 function fmt(n) { return "$" + Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2 }); }
+
 const DEPT_DEFAULT_LEADS = { "fiat finance": "Kaley", "uncovered": "Nick" };
 function getDefaultLead(d) { return DEPT_DEFAULT_LEADS[d?.toLowerCase().trim()] || ""; }
 
 function Badge({ status }) {
-  const s = { active: "bg-emerald-50 text-emerald-700", pending: "bg-amber-50 text-amber-700", approved: "bg-blue-50 text-blue-700", sent: "bg-purple-50 text-purple-700", rejected: "bg-red-50 text-red-700", archived: "bg-gray-100 text-gray-500" };
+  const s = { active: "bg-emerald-50 text-emerald-700", pending: "bg-amber-50 text-amber-700", approved: "bg-blue-50 text-blue-700", sent: "bg-purple-50 text-purple-700", rejected: "bg-red-50 text-red-700", archived: "bg-gray-100 text-gray-500", "see notes": "bg-orange-50 text-orange-600" };
   return <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${s[status] || "bg-gray-100 text-gray-500"}`}>{status.charAt(0).toUpperCase() + status.slice(1)}</span>;
 }
 
@@ -42,8 +43,151 @@ function Modal({ title, onClose, children, wide }) {
   );
 }
 
-function parseColDate(h) {
-  h = String(h);
+function DroppedClients({ clients, currentMonthLabel, nextMonthLabel }) {
+  const dropped = clients.filter(c => c.amount > 0 && c.nextAmount === 0);
+  if (!dropped.length) return null;
+  return (
+    <div className="bg-white rounded-2xl border border-red-100 overflow-hidden">
+      <div className="px-6 py-4 border-b border-red-50 flex items-center justify-between">
+        <h2 className="font-medium text-red-700">No billing next month</h2>
+        <span className="text-xs text-red-400">{dropped.length} client{dropped.length > 1 ? "s" : ""} had billing this month but not next</span>
+      </div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-xs text-gray-400 border-b border-gray-50">
+            <th className="px-6 py-3 text-left">Client</th>
+            <th className="px-6 py-3 text-left">Lead</th>
+            <th className="px-6 py-3 text-left">Departments</th>
+            <th className="px-6 py-3 text-right">{currentMonthLabel}</th>
+            <th className="px-6 py-3 text-right">{nextMonthLabel || "Next Month"}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {dropped.map(c => {
+            const depts = [...new Set(c.lines.map(l => l.department))].filter(Boolean);
+            return (
+              <tr key={c.id} className="border-b border-gray-50 hover:bg-red-50 transition-colors">
+                <td className="px-6 py-3 font-medium text-gray-800">{c.name}</td>
+                <td className="px-6 py-3 text-xs text-gray-500">{c.lead || "—"}</td>
+                <td className="px-6 py-3"><div className="flex flex-wrap gap-1">{depts.map(d => <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{d}</span>)}</div></td>
+                <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(c.amount)}</td>
+                <td className="px-6 py-3 text-right text-red-500 font-medium">$0.00</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function InvoiceApprovals({ invoices, setInvoices, currentMonthLabel, nextMonthLabel, qboConnected, setShowApprove, setApproveComment, setShowInvoiceDetail, onSaveInvoices }) {
+  const [filterLead, setFilterLead] = useState("all");
+  const base = invoices.filter(inv => inv.nextAmount > 0);
+  const leads = ["all", ...new Set(base.map(inv => inv.lead).filter(Boolean))];
+  const filtered = filterLead === "all" ? base : base.filter(inv => inv.lead === filterLead);
+  const pendingCount = filtered.filter(i => i.status === "pending").length;
+  const approvedCount = filtered.filter(i => i.status === "approved").length;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <h2 className="font-medium text-gray-800">Invoice Approvals</h2>
+          <p className="text-xs text-gray-400 mt-0.5">Next month forecast ({nextMonthLabel || "upcoming"}) vs current month ({currentMonthLabel || "current"})</p>
+        </div>
+        <div className="flex items-center gap-3 flex-wrap">
+          <div className="flex gap-1 flex-wrap">
+            {leads.map(l => (
+              <button key={l} onClick={() => setFilterLead(l)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${filterLead === l ? "bg-gray-900 text-white" : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50"}`}>
+                {l === "all" ? "All leads" : l}
+              </button>
+            ))}
+          </div>
+          <div className="flex gap-2 text-xs">
+            <span className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full">{pendingCount} pending</span>
+            <span className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full">{approvedCount} approved</span>
+          </div>
+        </div>
+      </div>
+      <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+        {invoices.length === 0 ? (
+          <div className="px-6 py-10 text-center text-gray-300 text-sm">No invoices — import your data first</div>
+        ) : filtered.length === 0 ? (
+          <div className="px-6 py-10 text-center text-gray-300 text-sm">No invoices for this lead</div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-xs text-gray-400 border-b border-gray-50">
+                <th className="px-6 py-3 text-left">Client</th>
+                <th className="px-6 py-3 text-left">Lead</th>
+                <th className="px-6 py-3 text-left">Departments</th>
+                <th className="px-6 py-3 text-right">{currentMonthLabel || "Current Month"}</th>
+                <th className="px-6 py-3 text-right">{nextMonthLabel || "Next Month"}</th>
+                <th className="px-6 py-3 text-right">Change</th>
+                <th className="px-6 py-3 text-left">Status</th>
+                <th className="px-6 py-3 text-left">Comment</th>
+                <th className="px-6 py-3"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(inv => {
+                const diff = inv.nextAmount - inv.amount;
+                const activeLines = inv.lines?.filter(l => (l.amounts[inv.nextMonthCol] || 0) > 0) || [];
+                const depts = [...new Set(inv.lines?.map(l => l.department).filter(Boolean))];
+                return (
+                  <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                    <td className="px-6 py-3">
+                      <div className="font-medium text-gray-800">{inv.clientName}</div>
+                      {activeLines.length > 0 && (
+                        <button onClick={() => setShowInvoiceDetail({ ...inv, monthCol: inv.nextMonthCol, amount: inv.nextAmount })}
+                          className="text-xs text-blue-500 hover:underline">
+                          View {activeLines.length} line{activeLines.length > 1 ? "s" : ""}
+                        </button>
+                      )}
+                    </td>
+                    <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
+                    <td className="px-6 py-3"><div className="flex flex-wrap gap-1">{depts.map(d => <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{d}</span>)}</div></td>
+                    <td className="px-6 py-3 text-right text-gray-500">{fmt(inv.amount)}</td>
+                    <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.nextAmount)}</td>
+                    <td className={`px-6 py-3 text-right font-medium ${diff >= 0 ? "text-emerald-600" : "text-red-500"}`}>{diff >= 0 ? "+" : ""}{fmt(diff)}</td>
+                    <td className="px-6 py-3"><Badge status={inv.status} /></td>
+                    <td className="px-6 py-3 text-gray-400 text-xs italic">{inv.comment || "—"}</td>
+                    <td className="px-6 py-3 text-right">
+                      <div className="flex gap-2 justify-end">
+                        {inv.status === "pending" && (
+                          <button onClick={() => { setShowApprove(inv); setApproveComment(""); }}
+                            className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700 transition-colors">Review</button>
+                        )}
+                        {inv.status === "see notes" && (
+                          <button onClick={() => { setShowApprove(inv); setApproveComment(inv.comment); }}
+                            className="text-xs bg-orange-500 text-white px-3 py-1 rounded-lg hover:bg-orange-600 transition-colors">See Notes</button>
+                        )}
+                        {inv.status === "approved" && qboConnected && (
+                          <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "sent" } : i); setInvoices(u); await onSaveInvoices(u); }}
+                            className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 transition-colors">Send via QBO</button>
+                        )}
+                        {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
+                        {inv.status === "rejected" && (
+                          <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "pending", comment: "" } : i); setInvoices(u); await onSaveInvoices(u); }}
+                            className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50 transition-colors">Resubmit</button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function parseColDate(header) {
+  const h = String(header);
   let m = h.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (m) return new Date(Number(m[3]), Number(m[1]) - 1, 1);
   const months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
@@ -64,61 +208,6 @@ function getMonthCols(headers) {
   return headers.map((h, i) => ({ h, i, d: parseColDate(h) })).filter(x => x.d).sort((a, b) => a.d - b.d);
 }
 
-// Inline editable cell
-function EditableCell({ value, onSave, prefix = "" }) {
-  const [editing, setEditing] = useState(false);
-  const [val, setVal] = useState("");
-  const ref = useRef();
-  function start() { setVal(String(value || 0)); setEditing(true); setTimeout(() => ref.current?.select(), 50); }
-  function save() { const n = parseFloat(String(val).replace(/[$,]/g, "")) || 0; onSave(n); setEditing(false); }
-  if (editing) return (
-    <input ref={ref} value={val} onChange={e => setVal(e.target.value)}
-      onBlur={save} onKeyDown={e => { if (e.key === "Enter") save(); if (e.key === "Escape") setEditing(false); }}
-      className="w-24 border border-blue-300 rounded px-2 py-0.5 text-right text-xs outline-none bg-blue-50" />
-  );
-  return (
-    <span onClick={start} className="cursor-pointer hover:bg-blue-50 hover:text-blue-700 px-1 py-0.5 rounded transition-colors" title="Click to edit">
-      {prefix}{fmt(value)}
-    </span>
-  );
-}
-
-function DroppedClients({ clients, currentMonthLabel, nextMonthLabel }) {
-  const dropped = clients.filter(c => c.amount > 0 && c.nextAmount === 0);
-  if (!dropped.length) return null;
-  return (
-    <div className="bg-white rounded-2xl border border-red-100 overflow-hidden">
-      <div className="px-6 py-4 border-b border-red-50 flex items-center justify-between">
-        <h2 className="font-medium text-red-700">No billing next month</h2>
-        <span className="text-xs text-red-400">{dropped.length} client{dropped.length > 1 ? "s" : ""} had billing this month but not next</span>
-      </div>
-      <table className="w-full text-sm">
-        <thead><tr className="text-xs text-gray-400 border-b border-gray-50">
-          <th className="px-6 py-3 text-left">Client</th>
-          <th className="px-6 py-3 text-left">Lead</th>
-          <th className="px-6 py-3 text-left">Departments</th>
-          <th className="px-6 py-3 text-right">{currentMonthLabel}</th>
-          <th className="px-6 py-3 text-right">{nextMonthLabel || "Next Month"}</th>
-        </tr></thead>
-        <tbody>
-          {dropped.map(c => {
-            const depts = [...new Set(c.lines.map(l => l.department))].filter(Boolean);
-            return (
-              <tr key={c.id} className="border-b border-gray-50 hover:bg-red-50 transition-colors">
-                <td className="px-6 py-3 font-medium text-gray-800">{c.name}</td>
-                <td className="px-6 py-3 text-xs text-gray-500">{c.lead || "—"}</td>
-                <td className="px-6 py-3"><div className="flex flex-wrap gap-1">{depts.map(d => <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{d}</span>)}</div></td>
-                <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(c.amount)}</td>
-                <td className="px-6 py-3 text-right text-red-500 font-medium">$0.00</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
 export default function App() {
   const [storageLoading, setStorageLoading] = useState(true);
   const [tab, setTab] = useState("dashboard");
@@ -127,9 +216,6 @@ export default function App() {
   const [clientPaste, setClientPaste] = useState("");
   const [leadPaste, setLeadPaste] = useState("");
   const [importError, setImportError] = useState("");
-  const [showAddClient, setShowAddClient] = useState(false);
-  const [newClient, setNewClient] = useState({ name: "", service: "", department: "", lead: "", currentAmt: "", nextAmt: "" });
-  const [editingClient, setEditingClient] = useState(null); // client id being edited inline
 
   const [rawRows, setRawRows] = useState([]);
   const [clients, setClients] = useState([]);
@@ -141,8 +227,6 @@ export default function App() {
   const [nextMonthLabel, setNextMonthLabel] = useState("");
   const [connected, setConnected] = useState(false);
   const [selectedMonth, setSelectedMonth] = useState("");
-  const [curColKey, setCurColKey] = useState("");
-  const [nextColKey, setNextColKey] = useState("");
 
   const [showApprove, setShowApprove] = useState(null);
   const [showInvoiceDetail, setShowInvoiceDetail] = useState(null);
@@ -150,7 +234,6 @@ export default function App() {
   const [qboConnected, setQboConnected] = useState(false);
   const [qboSyncing, setQboSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [filterLead, setFilterLead] = useState("all");
 
   const [aiMessages, setAiMessages] = useState([{ role: "assistant", content: "Hi! Import your data from Google Sheets and then ask me anything about your clients, invoices, or monthly performance." }]);
   const [aiInput, setAiInput] = useState("");
@@ -162,14 +245,18 @@ export default function App() {
     async function load() {
       try {
         const d = await loadFromSupabase();
-        if (d?.clients?.length) {
-          setRawRows(d.rawRows || []); setClients(d.clients || []); setApprovers(d.approvers || []);
-          setInvoices(d.invoices || []); setMonthCols(d.monthCols || []);
-          setCurrentMonthLabel(d.currentMonthLabel || ""); setLastMonthLabel(d.lastMonthLabel || "");
-          setNextMonthLabel(d.nextMonthLabel || ""); setSelectedMonth(d.selectedMonth || "");
-          setCurColKey(d.curColKey || ""); setNextColKey(d.nextColKey || "");
+        if (d && d.clients?.length) {
+          setRawRows(d.rawRows || []);
+          setClients(d.clients || []);
+          setApprovers(d.approvers || []);
+          setInvoices(d.invoices || []);
+          setMonthCols(d.monthCols || []);
+          setCurrentMonthLabel(d.currentMonthLabel || "");
+          setLastMonthLabel(d.lastMonthLabel || "");
+          setNextMonthLabel(d.nextMonthLabel || "");
+          setSelectedMonth(d.selectedMonth || "");
           setConnected(true);
-          setAiMessages([{ role: "assistant", content: `Data loaded: ${(d.clients || []).length} clients. Ask me anything!` }]);
+          setAiMessages([{ role: "assistant", content: `Datos cargados: ${(d.clients || []).length} clientes. ¡Preguntame lo que quieras!` }]);
         }
       } catch (_) {}
       setStorageLoading(false);
@@ -177,51 +264,10 @@ export default function App() {
     load();
   }, []);
 
-  async function saveAll(patch) {
+  async function saveAll(data) {
     setSaving(true);
-    try { await saveToSupabase(patch); } catch (_) {}
+    try { await saveToSupabase(data); } catch (_) {}
     setSaving(false);
-  }
-
-  // Update a single client's amount and sync to invoice
-  async function updateClientAmount(clientId, field, newVal, allClients, allInvoices) {
-    const updatedClients = allClients.map(c => c.id === clientId ? { ...c, [field]: newVal } : c);
-    const updatedInvoices = allInvoices.map(inv => {
-      if (inv.clientId !== clientId) return inv;
-      return {
-        ...inv,
-        amount: field === "amount" ? newVal : inv.amount,
-        nextAmount: field === "nextAmount" ? newVal : inv.nextAmount,
-      };
-    });
-    setClients(updatedClients);
-    setInvoices(updatedInvoices);
-    const saved = await loadFromSupabase();
-    if (saved) await saveToSupabase({ ...saved, clients: updatedClients, invoices: updatedInvoices });
-  }
-
-  // Add a brand new client manually
-  async function addClientManually() {
-    if (!newClient.name.trim()) return;
-    const id = Date.now();
-    const curAmt = parseFloat(newClient.currentAmt) || 0;
-    const nextAmt = parseFloat(newClient.nextAmt) || 0;
-    const lead = newClient.lead || getDefaultLead(newClient.department) || "";
-    const line = { _id: id, clientName: newClient.name.trim(), service: newClient.service, department: newClient.department, lead, amounts: { [curColKey]: curAmt, [nextColKey]: nextAmt } };
-    const newC = { id, name: newClient.name.trim(), status: "active", lines: [line], lead, amount: curAmt, lastAmount: 0, nextAmount: nextAmt, multiDept: false };
-    const newInv = {
-      id, clientId: id, clientName: newC.name, amount: curAmt, lastAmount: 0, nextAmount: nextAmt,
-      approver: approvers[0] || "", lead, status: "pending", comment: "",
-      month: currentMonthLabel, monthCol: curColKey, nextMonthCol: nextColKey,
-      lines: [line], multiDept: false,
-    };
-    const updatedClients = [...clients, newC];
-    const updatedInvoices = [...invoices, newInv];
-    setClients(updatedClients); setInvoices(updatedInvoices);
-    setShowAddClient(false);
-    setNewClient({ name: "", service: "", department: "", lead: "", currentAmt: "", nextAmt: "" });
-    const saved = await loadFromSupabase();
-    if (saved) await saveToSupabase({ ...saved, clients: updatedClients, invoices: updatedInvoices });
   }
 
   async function processImport() {
@@ -249,7 +295,8 @@ export default function App() {
       const deptKey = headers.find(h => /department|dept/i.test(h));
       if (!nameKey) throw new Error("Could not find a 'Client Name' column.");
 
-      let leadMap = {}, approverNames = [];
+      let leadMap = {};
+      let approverNames = [];
       if (leadPaste.trim()) {
         const leadRows = parsePaste(leadPaste);
         const { objects: lo, headers: lh } = rowsToObjects(leadRows);
@@ -277,9 +324,10 @@ export default function App() {
         multiDept: new Set(g.lines.map(l => l.department).filter(Boolean)).size > 1,
       }));
 
-      // Preserve existing approval statuses
+      const prevInvoices = invoices; // preserve existing statuses
+
       const invoiceList = clientList.map((c, i) => {
-        const existing = invoices.find(p => p.clientName === c.name);
+        const existing = prevInvoices.find(p => p.clientName === c.name);
         return {
           id: i + 1, clientId: c.id, clientName: c.name,
           amount: c.amount, lastAmount: c.lastAmount, nextAmount: c.nextAmount,
@@ -294,18 +342,18 @@ export default function App() {
       setRawRows(enriched); setClients(clientList); setApprovers(approverNames);
       setInvoices(invoiceList); setMonthCols(cols);
       setCurrentMonthLabel(curLabel); setLastMonthLabel(prevLabel); setNextMonthLabel(nextLabel);
-      setSelectedMonth(curCol.h); setCurColKey(curCol.h); setNextColKey(nextCol?.h || "");
-      setConnected(true);
+      setSelectedMonth(curCol.h); setConnected(true);
       setShowImport(false); setClientPaste(""); setLeadPaste(""); setImportStep("clients");
       setAiMessages([{ role: "assistant", content: `Synced ${clientList.length} clients with ${enriched.length} service lines. Ask me anything!` }]);
 
-      await saveAll({ rawRows: enriched, clients: clientList, approvers: approverNames, invoices: invoiceList, monthCols: cols, currentMonthLabel: curLabel, lastMonthLabel: prevLabel, nextMonthLabel: nextLabel, selectedMonth: curCol.h, curColKey: curCol.h, nextColKey: nextCol?.h || "" });
+      await saveAll({ rawRows: enriched, clients: clientList, approvers: approverNames, invoices: invoiceList, monthCols: cols, currentMonthLabel: curLabel, lastMonthLabel: prevLabel, nextMonthLabel: nextLabel, selectedMonth: curCol.h });
     } catch (e) { setImportError(e.message); }
   }
 
   async function approveInvoice(decision) {
     const updated = invoices.map(i => i.id === showApprove.id ? { ...i, status: decision, comment: approveComment } : i);
-    setInvoices(updated); setApproveComment(""); setShowApprove(null);
+    setInvoices(updated);
+    setApproveComment(""); setShowApprove(null);
     const saved = await loadFromSupabase();
     if (saved) await saveToSupabase({ ...saved, invoices: updated });
   }
@@ -318,12 +366,8 @@ export default function App() {
   const activeClients = clients.filter(c => c.status === "active");
   const totalProjected = activeClients.reduce((s, c) => s + c.amount, 0);
   const totalLast = activeClients.reduce((s, c) => s + c.lastAmount, 0);
-  const totalNext = activeClients.reduce((s, c) => s + c.nextAmount, 0);
-  const pendingCount = invoices.filter(i => i.status === "pending" && i.nextAmount > 0).length;
+  const pendingCount = invoices.filter(i => i.status === "pending").length;
   const approvedCount = invoices.filter(i => i.status === "approved").length;
-
-  const approvalLeads = ["all", ...new Set(invoices.filter(i => i.nextAmount > 0).map(i => i.lead).filter(Boolean))];
-  const filteredApprovals = invoices.filter(i => i.nextAmount > 0 && (filterLead === "all" || i.lead === filterLead));
 
   async function sendAI() {
     if (!aiInput.trim() || aiLoading) return;
@@ -331,10 +375,10 @@ export default function App() {
     setAiMessages(p => [...p, { role: "user", content: userMsg }]);
     setAiLoading(true);
     const ctx = `You are a finance assistant for a service business agency.
-CLIENTS: ${JSON.stringify(clients.map(c => ({ name: c.name, lead: c.lead, amount: c.amount, nextAmount: c.nextAmount })))}
-INVOICES: ${JSON.stringify(invoices.map(i => ({ client: i.clientName, lead: i.lead, amount: i.amount, nextAmount: i.nextAmount, status: i.status })))}
+CLIENTS: ${JSON.stringify(clients.map(c => ({ name: c.name, lead: c.lead, amount: c.amount, lastAmount: c.lastAmount, nextAmount: c.nextAmount })))}
+INVOICES: ${JSON.stringify(invoices.map(i => ({ client: i.clientName, lead: i.lead, amount: i.amount, status: i.status })))}
 CURRENT MONTH: ${currentMonthLabel}, LAST MONTH: ${lastMonthLabel}, NEXT MONTH: ${nextMonthLabel}
-TOTAL THIS MONTH: ${fmt(totalProjected)}, TOTAL NEXT MONTH: ${fmt(totalNext)}
+TOTAL PROJECTED: ${fmt(totalProjected)}, TOTAL LAST MONTH: ${fmt(totalLast)}
 Answer concisely in English. Use USD formatting.`;
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -352,32 +396,36 @@ Answer concisely in English. Use USD formatting.`;
 
   if (storageLoading) return (
     <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-      <p className="text-gray-400 text-sm">Loading data...</p>
+      <p className="text-gray-400 text-sm">Cargando datos...</p>
     </div>
   );
 
   return (
     <div className="min-h-screen bg-gray-50 font-sans">
-      {/* Header */}
       <div className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-xl font-semibold text-gray-900">InvoiceFlow</h1>
           <p className="text-xs text-gray-400">Service Business Dashboard</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
-          {saving && <span className="text-xs text-gray-400">Saving...</span>}
-          {approvedCount > 0 && (
+          {saving && <span className="text-xs text-gray-400">Guardando...</span>}
+          {invoices.filter(i => i.status === "approved").length > 0 && (
             <button onClick={() => {
               const approved = invoices.filter(i => i.status === "approved");
-              const rows = [["Client","Lead","Department","Service","Month","Amount"]];
+              const rows = [["Client", "Lead", "Department", "Service", "Month", "Amount"]];
               approved.forEach(inv => {
                 const lines = inv.lines?.filter(l => (l.amounts[inv.monthCol] || 0) > 0) || [];
-                if (!lines.length) rows.push([inv.clientName, inv.lead, "", "", inv.month, inv.amount]);
-                else lines.forEach(l => rows.push([inv.clientName, inv.lead, l.department, l.service, inv.month, l.amounts[inv.monthCol]]));
+                if (lines.length === 0) {
+                  rows.push([inv.clientName, inv.lead, "", "", inv.month, inv.amount]);
+                } else {
+                  lines.forEach(l => rows.push([inv.clientName, inv.lead, l.department, l.service, inv.month, l.amounts[inv.monthCol]]));
+                }
               });
-              const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(",")).join("\n");
-              const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
-              a.download = `approved-${currentMonthLabel.replace(" ","-")}.csv`; a.click();
+              const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+              const a = document.createElement("a");
+              a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+              a.download = `invoices-approved-${currentMonthLabel.replace(" ", "-")}.csv`;
+              a.click();
             }} className="px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 transition-colors">
               Export Approved CSV
             </button>
@@ -393,7 +441,6 @@ Answer concisely in English. Use USD formatting.`;
         </div>
       </div>
 
-      {/* Tabs */}
       <div className="bg-white border-b border-gray-100 px-6 overflow-x-auto">
         <div className="flex gap-6 min-w-max">
           {tabs.map(t => (
@@ -411,21 +458,20 @@ Answer concisely in English. Use USD formatting.`;
         <div className="max-w-6xl mx-auto px-6 pt-6">
           <div className="bg-blue-50 border border-blue-100 rounded-2xl px-6 py-4 text-sm text-blue-700 flex items-center justify-between">
             <span>Import your data from Google Sheets to get started.</span>
-            <button onClick={() => setShowImport(true)} className="ml-4 bg-blue-700 text-white px-4 py-1.5 rounded-lg text-xs hover:bg-blue-800">Import now</button>
+            <button onClick={() => setShowImport(true)} className="ml-4 bg-blue-700 text-white px-4 py-1.5 rounded-lg text-xs hover:bg-blue-800 transition-colors">Import now</button>
           </div>
         </div>
       )}
 
       <div className="max-w-6xl mx-auto px-6 py-8">
 
-        {/* DASHBOARD */}
         {tab === "dashboard" && (
           <div className="space-y-6">
             <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
               {[
-                { label: `Projected — ${nextMonthLabel || "next month"}`, value: fmt(totalNext), sub: `${activeClients.length} active clients` },
-                { label: `Invoiced — ${currentMonthLabel || "this month"}`, value: fmt(totalProjected), sub: "current month" },
-                { label: "Month-over-Month", value: (totalNext - totalProjected >= 0 ? "+" : "") + fmt(totalNext - totalProjected), sub: totalNext >= totalProjected ? "increase" : "decrease", color: totalNext >= totalProjected ? "text-emerald-600" : "text-red-500" },
+                { label: `Projected — ${nextMonthLabel || "next month"}`, value: fmt(activeClients.reduce((s, c) => s + c.nextAmount, 0)), sub: `${activeClients.length} active clients` },
+                { label: `Invoiced — ${currentMonthLabel || "this month"}`, value: fmt(totalProjected), sub: "actual billed" },
+                { label: "Month-over-Month", value: (activeClients.reduce((s, c) => s + c.nextAmount, 0) - totalLast >= 0 ? "+" : "") + fmt(activeClients.reduce((s, c) => s + c.nextAmount, 0) - totalLast), sub: activeClients.reduce((s, c) => s + c.nextAmount, 0) >= totalLast ? "increase" : "decrease", color: activeClients.reduce((s, c) => s + c.nextAmount, 0) >= totalLast ? "text-emerald-600" : "text-red-500" },
                 { label: "Pending Approval", value: pendingCount, sub: `${approvedCount} approved` },
               ].map(c => (
                 <div key={c.label} className="bg-white rounded-2xl p-5 border border-gray-100">
@@ -436,7 +482,7 @@ Answer concisely in English. Use USD formatting.`;
               ))}
             </div>
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-              <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
+              <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between flex-wrap gap-2">
                 <h2 className="font-medium text-gray-800">Month Comparison by Client</h2>
                 <span className="text-xs text-gray-400">{currentMonthLabel} vs {nextMonthLabel}</span>
               </div>
@@ -444,18 +490,20 @@ Answer concisely in English. Use USD formatting.`;
                 <div className="px-6 py-10 text-center text-gray-300 text-sm">Import your data to see the comparison</div>
               ) : (
                 <table className="w-full text-sm">
-                  <thead><tr className="text-xs text-gray-400 border-b border-gray-50">
-                    <th className="px-6 py-3 text-left">Client</th>
-                    <th className="px-6 py-3 text-left">Lead</th>
-                    <th className="px-6 py-3 text-left">Departments</th>
-                    <th className="px-6 py-3 text-right">{currentMonthLabel}</th>
-                    <th className="px-6 py-3 text-right">{nextMonthLabel}</th>
-                    <th className="px-6 py-3 text-right">Change</th>
-                    <th className="px-6 py-3 text-left">Invoice</th>
-                  </tr></thead>
+                  <thead>
+                    <tr className="text-xs text-gray-400 border-b border-gray-50">
+                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-6 py-3 text-left">Lead</th>
+                      <th className="px-6 py-3 text-left">Departments</th>
+                      <th className="px-6 py-3 text-right">{currentMonthLabel}</th>
+                      <th className="px-6 py-3 text-right">{nextMonthLabel}</th>
+                      <th className="px-6 py-3 text-right">Change</th>
+                      <th className="px-6 py-3 text-left">Invoice</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {activeClients.filter(c => c.amount > 0 || c.nextAmount > 0).map(c => {
-                      const diff = c.nextAmount - c.amount;
+                      const diff = c.amount - c.lastAmount;
                       const inv = invoices.find(i => i.clientId === c.id);
                       const depts = [...new Set(c.lines.map(l => l.department))].filter(Boolean);
                       return (
@@ -465,7 +513,7 @@ Answer concisely in English. Use USD formatting.`;
                           <td className="px-6 py-3"><div className="flex flex-wrap gap-1">{depts.map(d => <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{d}</span>)}</div></td>
                           <td className="px-6 py-3 text-right text-gray-500">{fmt(c.amount)}</td>
                           <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(c.nextAmount)}</td>
-                          <td className={`px-6 py-3 text-right font-medium ${diff >= 0 ? "text-emerald-600" : "text-red-500"}`}>{diff >= 0 ? "+" : ""}{fmt(diff)}</td>
+                          <td className={`px-6 py-3 text-right font-medium ${c.nextAmount - c.amount >= 0 ? "text-emerald-600" : "text-red-500"}`}>{c.nextAmount - c.amount >= 0 ? "+" : ""}{fmt(c.nextAmount - c.amount)}</td>
                           <td className="px-6 py-3">{inv && <Badge status={inv.status} />}</td>
                         </tr>
                       );
@@ -478,60 +526,53 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         )}
 
-        {/* CLIENTS */}
         {tab === "clients" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-2">
               <h2 className="font-medium text-gray-800">Clients ({activeClients.length} active · {rawRows.length} service lines)</h2>
-              <div className="flex gap-2">
-                {monthCols.length > 0 && (
-                  <select value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)}
-                    className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600">
-                    {monthCols.map(c => <option key={c.h} value={c.h}>{formatMonthLabel(c.d)}</option>)}
-                  </select>
-                )}
-                <button onClick={() => setShowAddClient(true)} className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors">+ Add Client</button>
-              </div>
-            </div>
-            <div className="bg-blue-50 border border-blue-100 rounded-xl px-4 py-2 text-xs text-blue-600">
-              💡 Click on any amount to edit it inline. Changes are saved automatically.
+              {monthCols.length > 0 && (
+                <select value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)}
+                  className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600">
+                  {monthCols.map(c => <option key={c.h} value={c.h}>{formatMonthLabel(c.d)}</option>)}
+                </select>
+              )}
             </div>
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               {clients.length === 0 ? (
                 <div className="px-6 py-10 text-center text-gray-300 text-sm">No clients — import your data</div>
               ) : (
                 <table className="w-full text-sm">
-                  <thead><tr className="text-xs text-gray-400 border-b border-gray-50">
-                    <th className="px-6 py-3 text-left">Client</th>
-                    <th className="px-6 py-3 text-left">Lead</th>
-                    <th className="px-6 py-3 text-left">Services</th>
-                    <th className="px-6 py-3 text-left">Departments</th>
-                    <th className="px-6 py-3 text-right">{currentMonthLabel || "Current"}</th>
-                    <th className="px-6 py-3 text-right">{nextMonthLabel || "Next"}</th>
-                    <th className="px-6 py-3 text-left">QBO Lines</th>
-                    <th className="px-6 py-3 text-left">Status</th>
-                  </tr></thead>
+                  <thead>
+                    <tr className="text-xs text-gray-400 border-b border-gray-50">
+                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-6 py-3 text-left">Lead</th>
+                      <th className="px-6 py-3 text-left">Services</th>
+                      <th className="px-6 py-3 text-left">Departments</th>
+                      <th className="px-6 py-3 text-right">{selectedMonth ? formatMonthLabel(parseColDate(selectedMonth)) : currentMonthLabel}</th>
+                      <th className="px-6 py-3 text-left">QBO Lines</th>
+                      <th className="px-6 py-3 text-left">Status</th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {clients.map(c => {
                       const services = [...new Set(c.lines.map(l => l.service))].filter(Boolean);
                       const depts = [...new Set(c.lines.map(l => l.department))].filter(Boolean);
+                      const monthAmt = c.lines.reduce((s, l) => s + (l.amounts[selectedMonth] || 0), 0);
                       return (
                         <tr key={c.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
                           <td className="px-6 py-3 font-medium text-gray-800">{c.name}</td>
                           <td className="px-6 py-3 text-xs text-gray-500">{c.lead || "—"}</td>
                           <td className="px-6 py-3 text-gray-500 text-xs">{services.join(", ")}</td>
                           <td className="px-6 py-3"><div className="flex flex-wrap gap-1">{depts.map(d => <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{d}</span>)}</div></td>
-                          <td className="px-6 py-3 text-right">
-                            <EditableCell value={c.amount} onSave={v => updateClientAmount(c.id, "amount", v, clients, invoices)} />
-                          </td>
-                          <td className="px-6 py-3 text-right">
-                            <EditableCell value={c.nextAmount} onSave={v => updateClientAmount(c.id, "nextAmount", v, clients, invoices)} />
-                          </td>
+                          <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(monthAmt)}</td>
                           <td className="px-6 py-3 text-xs">{c.multiDept ? <span className="text-blue-600">{depts.length} lines</span> : <span className="text-gray-400">1 line</span>}</td>
                           <td className="px-6 py-3">
                             <div className="flex items-center gap-2">
                               <Badge status={c.status} />
-                              {c.status === "active" && <button onClick={() => setClients(p => p.map(x => x.id === c.id ? {...x, status:"archived"} : x))} className="text-xs text-gray-300 hover:text-red-400 transition-colors">Archive</button>}
+                              {c.status === "active" && (
+                                <button onClick={() => setClients(p => p.map(x => x.id === c.id ? { ...x, status: "archived" } : x))}
+                                  className="text-xs text-gray-300 hover:text-red-400 transition-colors">Archive</button>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -544,7 +585,6 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         )}
 
-        {/* INVOICES */}
         {tab === "invoices" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-2">
@@ -556,16 +596,18 @@ Answer concisely in English. Use USD formatting.`;
                 <div className="px-6 py-10 text-center text-gray-300 text-sm">No invoices — import your data first</div>
               ) : (
                 <table className="w-full text-sm">
-                  <thead><tr className="text-xs text-gray-400 border-b border-gray-50">
-                    <th className="px-6 py-3 text-left">Client</th>
-                    <th className="px-6 py-3 text-left">Lead</th>
-                    <th className="px-6 py-3 text-right">Amount</th>
-                    <th className="px-6 py-3 text-left">QBO Lines</th>
-                    <th className="px-6 py-3 text-left">Approver</th>
-                    <th className="px-6 py-3 text-left">Status</th>
-                    <th className="px-6 py-3 text-left">Comment</th>
-                    <th className="px-6 py-3"></th>
-                  </tr></thead>
+                  <thead>
+                    <tr className="text-xs text-gray-400 border-b border-gray-50">
+                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-6 py-3 text-left">Lead</th>
+                      <th className="px-6 py-3 text-right">Amount</th>
+                      <th className="px-6 py-3 text-left">QBO Lines</th>
+                      <th className="px-6 py-3 text-left">Approver</th>
+                      <th className="px-6 py-3 text-left">Status</th>
+                      <th className="px-6 py-3 text-left">Comment</th>
+                      <th className="px-6 py-3"></th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {invoices.map(inv => {
                       const activeLines = inv.lines?.filter(l => (l.amounts[inv.monthCol] || 0) > 0) || [];
@@ -573,7 +615,11 @@ Answer concisely in English. Use USD formatting.`;
                         <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
                           <td className="px-6 py-3">
                             <div className="font-medium text-gray-800">{inv.clientName}</div>
-                            {activeLines.length > 0 && <button onClick={() => setShowInvoiceDetail(inv)} className="text-xs text-blue-500 hover:underline">View {activeLines.length} line{activeLines.length > 1 ? "s" : ""}</button>}
+                            {activeLines.length > 0 && (
+                              <button onClick={() => setShowInvoiceDetail(inv)} className="text-xs text-blue-500 hover:underline">
+                                View {activeLines.length} line{activeLines.length > 1 ? "s" : ""}
+                              </button>
+                            )}
                           </td>
                           <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
                           <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.amount)}</td>
@@ -583,10 +629,11 @@ Answer concisely in English. Use USD formatting.`;
                           <td className="px-6 py-3 text-gray-400 text-xs italic">{inv.comment || "—"}</td>
                           <td className="px-6 py-3 text-right">
                             <div className="flex gap-2 justify-end">
-                              {inv.status === "pending" && <button onClick={() => { setShowApprove(inv); setApproveComment(""); }} className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700">Review</button>}
-                              {inv.status === "approved" && qboConnected && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? {...i, status:"sent"} : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700">Send via QBO</button>}
+                        {inv.status === "pending" && <button onClick={() => { setShowApprove(inv); setApproveComment(""); }} className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700 transition-colors">Review</button>}
+                              {inv.status === "see notes" && <button onClick={() => { setShowApprove(inv); setApproveComment(inv.comment); }} className="text-xs bg-orange-500 text-white px-3 py-1 rounded-lg hover:bg-orange-600 transition-colors">See Notes</button>}
+                              {inv.status === "approved" && qboConnected && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "sent" } : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 transition-colors">Send via QBO</button>}
                               {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
-                              {inv.status === "rejected" && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? {...i, status:"pending", comment:""} : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50">Resubmit</button>}
+                              {inv.status === "rejected" && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? { ...i, status: "pending", comment: "" } : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50 transition-colors">Resubmit</button>}
                             </div>
                           </td>
                         </tr>
@@ -599,82 +646,18 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         )}
 
-        {/* INVOICE APPROVALS */}
         {tab === "invoice approvals" && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <div>
-                <h2 className="font-medium text-gray-800">Invoice Approvals</h2>
-                <p className="text-xs text-gray-400 mt-0.5">Next month forecast ({nextMonthLabel || "upcoming"}) vs current month ({currentMonthLabel || "current"})</p>
-              </div>
-              <div className="flex items-center gap-3 flex-wrap">
-                <div className="flex gap-1 flex-wrap">
-                  {approvalLeads.map(l => (
-                    <button key={l} onClick={() => setFilterLead(l)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${filterLead === l ? "bg-gray-900 text-white" : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50"}`}>
-                      {l === "all" ? "All leads" : l}
-                    </button>
-                  ))}
-                </div>
-                <div className="flex gap-2 text-xs">
-                  <span className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full">{filteredApprovals.filter(i => i.status === "pending").length} pending</span>
-                  <span className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full">{filteredApprovals.filter(i => i.status === "approved").length} approved</span>
-                </div>
-              </div>
-            </div>
-            <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-              {filteredApprovals.length === 0 ? (
-                <div className="px-6 py-10 text-center text-gray-300 text-sm">{invoices.length === 0 ? "No invoices — import your data first" : "No invoices for this lead"}</div>
-              ) : (
-                <table className="w-full text-sm">
-                  <thead><tr className="text-xs text-gray-400 border-b border-gray-50">
-                    <th className="px-6 py-3 text-left">Client</th>
-                    <th className="px-6 py-3 text-left">Lead</th>
-                    <th className="px-6 py-3 text-left">Departments</th>
-                    <th className="px-6 py-3 text-right">{currentMonthLabel || "Current"}</th>
-                    <th className="px-6 py-3 text-right">{nextMonthLabel || "Next Month"}</th>
-                    <th className="px-6 py-3 text-right">Change</th>
-                    <th className="px-6 py-3 text-left">Status</th>
-                    <th className="px-6 py-3 text-left">Comment</th>
-                    <th className="px-6 py-3"></th>
-                  </tr></thead>
-                  <tbody>
-                    {filteredApprovals.map(inv => {
-                      const diff = inv.nextAmount - inv.amount;
-                      const activeLines = inv.lines?.filter(l => (l.amounts[inv.nextMonthCol] || 0) > 0) || [];
-                      const depts = [...new Set(inv.lines?.map(l => l.department).filter(Boolean))];
-                      return (
-                        <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
-                          <td className="px-6 py-3">
-                            <div className="font-medium text-gray-800">{inv.clientName}</div>
-                            {activeLines.length > 0 && <button onClick={() => setShowInvoiceDetail({ ...inv, monthCol: inv.nextMonthCol, amount: inv.nextAmount })} className="text-xs text-blue-500 hover:underline">View {activeLines.length} line{activeLines.length > 1 ? "s" : ""}</button>}
-                          </td>
-                          <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
-                          <td className="px-6 py-3"><div className="flex flex-wrap gap-1">{depts.map(d => <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{d}</span>)}</div></td>
-                          <td className="px-6 py-3 text-right text-gray-500">{fmt(inv.amount)}</td>
-                          <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.nextAmount)}</td>
-                          <td className={`px-6 py-3 text-right font-medium ${diff >= 0 ? "text-emerald-600" : "text-red-500"}`}>{diff >= 0 ? "+" : ""}{fmt(diff)}</td>
-                          <td className="px-6 py-3"><Badge status={inv.status} /></td>
-                          <td className="px-6 py-3 text-gray-400 text-xs italic">{inv.comment || "—"}</td>
-                          <td className="px-6 py-3 text-right">
-                            <div className="flex gap-2 justify-end">
-                              {inv.status === "pending" && <button onClick={() => { setShowApprove(inv); setApproveComment(""); }} className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700">Review</button>}
-                              {inv.status === "approved" && qboConnected && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? {...i, status:"sent"} : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700">Send via QBO</button>}
-                              {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
-                              {inv.status === "rejected" && <button onClick={async () => { const u = invoices.map(i => i.id === inv.id ? {...i, status:"pending", comment:""} : i); setInvoices(u); await handleSaveInvoices(u); }} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50">Resubmit</button>}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          </div>
+          <InvoiceApprovals
+            invoices={invoices} setInvoices={setInvoices}
+            currentMonthLabel={currentMonthLabel} nextMonthLabel={nextMonthLabel}
+            pendingCount={pendingCount} approvedCount={approvedCount}
+            qboConnected={qboConnected}
+            setShowApprove={setShowApprove} setApproveComment={setApproveComment}
+            setShowInvoiceDetail={setShowInvoiceDetail}
+            onSaveInvoices={handleSaveInvoices}
+          />
         )}
 
-        {/* AI ASSISTANT */}
         {tab === "ai assistant" && (
           <div className="bg-white rounded-2xl border border-gray-100 flex flex-col" style={{ height: "520px" }}>
             <div className="px-6 py-4 border-b border-gray-50">
@@ -692,19 +675,18 @@ Answer concisely in English. Use USD formatting.`;
             </div>
             <div className="px-6 py-4 border-t border-gray-50 flex gap-3">
               <input value={aiInput} onChange={e => setAiInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendAI()}
-                placeholder="e.g. Which clients have more than one department?" className="flex-1 border border-gray-200 rounded-xl px-4 py-2 text-sm outline-none focus:border-gray-400" />
-              <button onClick={sendAI} disabled={aiLoading} className="bg-gray-900 text-white px-4 py-2 rounded-xl text-sm hover:bg-gray-700 disabled:opacity-40">Send</button>
+                placeholder="e.g. Which clients have more than one department?" className="flex-1 border border-gray-200 rounded-xl px-4 py-2 text-sm outline-none focus:border-gray-400 transition-colors" />
+              <button onClick={sendAI} disabled={aiLoading} className="bg-gray-900 text-white px-4 py-2 rounded-xl text-sm hover:bg-gray-700 transition-colors disabled:opacity-40">Send</button>
             </div>
           </div>
         )}
       </div>
 
-      {/* IMPORT MODAL */}
       {showImport && (
         <Modal title="Import from Google Sheets" onClose={() => setShowImport(false)} wide>
           <div className="space-y-4">
             <div className="flex rounded-xl overflow-hidden border border-gray-100">
-              {["clients","leads"].map((s, idx) => (
+              {["clients", "leads"].map((s, idx) => (
                 <button key={s} onClick={() => setImportStep(s)}
                   className={`flex-1 py-2 text-sm font-medium transition-colors ${importStep === s ? "bg-gray-900 text-white" : "bg-gray-50 text-gray-500 hover:bg-gray-100"}`}>
                   {idx + 1}. {s === "clients" ? "Forecasted Revenues" : "Leads (team)"}
@@ -719,13 +701,14 @@ Answer concisely in English. Use USD formatting.`;
                   <p>2. Click on cell <strong>D1</strong> (Client Name header)</p>
                   <p>3. Select all data from D1 to the last column and row with data</p>
                   <p>4. Copy (Ctrl+C / Cmd+C) and paste below</p>
-                  <p className="text-blue-500">Existing approval statuses are preserved on re-import.</p>
                 </div>
                 <textarea value={clientPaste} onChange={e => setClientPaste(e.target.value)}
                   placeholder={"Client Name\tService\tDepartment\t01/01/2025\t02/01/2025\nAcme Corp\tPaid\tCore Growth\t4500\t5000"}
-                  className="w-full border border-gray-200 rounded-xl px-4 py-3 text-xs font-mono outline-none focus:border-gray-400 resize-none" rows={9} />
+                  className="w-full border border-gray-200 rounded-xl px-4 py-3 text-xs font-mono outline-none focus:border-gray-400 transition-colors resize-none" rows={9} />
                 <button onClick={() => setImportStep("leads")} disabled={!clientPaste.trim()}
-                  className="w-full bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">Next: Paste team data</button>
+                  className="w-full bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 transition-colors disabled:opacity-40">
+                  Next: Paste team data
+                </button>
               </div>
             )}
             {importStep === "leads" && (
@@ -737,13 +720,13 @@ Answer concisely in English. Use USD formatting.`;
                   <p>3. Copy and paste below</p>
                 </div>
                 <textarea value={leadPaste} onChange={e => setLeadPaste(e.target.value)}
-                  placeholder={"Client\tLead\nAcme Corp\tSarah Johnson"}
-                  className="w-full border border-gray-200 rounded-xl px-4 py-3 text-xs font-mono outline-none focus:border-gray-400 resize-none" rows={6} />
+                  placeholder={"Client\tLead\nAcme Corp\tSarah Johnson\nBlueSky LLC\tMike Torres"}
+                  className="w-full border border-gray-200 rounded-xl px-4 py-3 text-xs font-mono outline-none focus:border-gray-400 transition-colors resize-none" rows={6} />
                 {importError && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{importError}</p>}
                 <div className="flex gap-3">
                   <button onClick={() => setImportStep("clients")} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">Back</button>
                   <button onClick={processImport} disabled={!clientPaste.trim()}
-                    className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">Import data</button>
+                    className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 transition-colors disabled:opacity-40">Import data</button>
                 </div>
               </div>
             )}
@@ -751,58 +734,19 @@ Answer concisely in English. Use USD formatting.`;
         </Modal>
       )}
 
-      {/* ADD CLIENT MODAL */}
-      {showAddClient && (
-        <Modal title="Add New Client" onClose={() => setShowAddClient(false)}>
-          <div className="space-y-3">
-            <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
-              This client will be added manually and won't affect your Google Sheet. It will be saved to the dashboard automatically.
-            </div>
-            {[
-              ["Client Name *", "name", "text"],
-              ["Service", "service", "text"],
-              ["Department", "department", "text"],
-              ["Lead", "lead", "text"],
-            ].map(([label, key, type]) => (
-              <div key={key}>
-                <label className="text-xs text-gray-500 mb-1 block">{label}</label>
-                <input type={type} value={newClient[key]} onChange={e => setNewClient(p => ({...p, [key]: e.target.value}))}
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400" />
-              </div>
-            ))}
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="text-xs text-gray-500 mb-1 block">{currentMonthLabel || "Current month"} amount</label>
-                <input type="number" value={newClient.currentAmt} onChange={e => setNewClient(p => ({...p, currentAmt: e.target.value}))}
-                  placeholder="0" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400" />
-              </div>
-              <div>
-                <label className="text-xs text-gray-500 mb-1 block">{nextMonthLabel || "Next month"} amount</label>
-                <input type="number" value={newClient.nextAmt} onChange={e => setNewClient(p => ({...p, nextAmt: e.target.value}))}
-                  placeholder="0" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400" />
-              </div>
-            </div>
-            <div className="flex gap-3 pt-2">
-              <button onClick={() => setShowAddClient(false)} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">Cancel</button>
-              <button onClick={addClientManually} disabled={!newClient.name.trim()}
-                className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">Add Client</button>
-            </div>
-          </div>
-        </Modal>
-      )}
-
-      {/* INVOICE DETAIL MODAL */}
       {showInvoiceDetail && (
         <Modal title={`Invoice lines — ${showInvoiceDetail.clientName}`} onClose={() => setShowInvoiceDetail(null)} wide>
           <div className="space-y-3">
             <p className="text-xs text-gray-400">Month: {showInvoiceDetail.month} · {showInvoiceDetail.multiDept ? "Separate QBO lines per department" : "Single QBO line"}</p>
             <table className="w-full text-sm">
-              <thead><tr className="text-xs text-gray-400 border-b border-gray-100">
-                <th className="py-2 text-left">Service</th>
-                <th className="py-2 text-left">Department</th>
-                <th className="py-2 text-left">Lead</th>
-                <th className="py-2 text-right">Amount</th>
-              </tr></thead>
+              <thead>
+                <tr className="text-xs text-gray-400 border-b border-gray-100">
+                  <th className="py-2 text-left">Service</th>
+                  <th className="py-2 text-left">Department</th>
+                  <th className="py-2 text-left">Lead</th>
+                  <th className="py-2 text-right">Amount</th>
+                </tr>
+              </thead>
               <tbody>
                 {showInvoiceDetail.lines?.filter(l => (l.amounts[showInvoiceDetail.monthCol] || 0) > 0).map((l, i) => (
                   <tr key={i} className="border-b border-gray-50">
@@ -813,17 +757,18 @@ Answer concisely in English. Use USD formatting.`;
                   </tr>
                 ))}
               </tbody>
-              <tfoot><tr>
-                <td colSpan={3} className="pt-3 text-sm font-medium text-gray-600">Total</td>
-                <td className="pt-3 text-right font-semibold text-gray-900">{fmt(showInvoiceDetail.amount)}</td>
-              </tr></tfoot>
+              <tfoot>
+                <tr>
+                  <td colSpan={3} className="pt-3 text-sm font-medium text-gray-600">Total</td>
+                  <td className="pt-3 text-right font-semibold text-gray-900">{fmt(showInvoiceDetail.amount)}</td>
+                </tr>
+              </tfoot>
             </table>
             <button onClick={() => setShowInvoiceDetail(null)} className="w-full border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">Close</button>
           </div>
         </Modal>
       )}
 
-      {/* APPROVE MODAL */}
       {showApprove && (
         <Modal title={`Review Invoice — ${showApprove.clientName}`} onClose={() => setShowApprove(null)}>
           <div className="space-y-4">
@@ -836,7 +781,7 @@ Answer concisely in English. Use USD formatting.`;
             </div>
             <div>
               <label className="text-xs text-gray-500 mb-1 block">Approver</label>
-              <select value={showApprove.approver} onChange={e => setShowApprove(p => ({...p, approver: e.target.value}))}
+              <select value={showApprove.approver} onChange={e => setShowApprove(p => ({ ...p, approver: e.target.value }))}
                 className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none">
                 {(approvers.length ? approvers : ["—"]).map(a => <option key={a}>{a}</option>)}
               </select>
@@ -844,11 +789,12 @@ Answer concisely in English. Use USD formatting.`;
             <div>
               <label className="text-xs text-gray-500 mb-1 block">Comment (optional)</label>
               <textarea value={approveComment} onChange={e => setApproveComment(e.target.value)} rows={2}
-                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none resize-none focus:border-gray-400" />
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none resize-none focus:border-gray-400 transition-colors" />
             </div>
             <div className="flex gap-3">
-              <button onClick={() => approveInvoice("rejected")} className="flex-1 border border-red-200 text-red-600 rounded-lg py-2 text-sm hover:bg-red-50">Reject</button>
-              <button onClick={() => approveInvoice("approved")} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700">Approve</button>
+              <button onClick={() => approveInvoice("rejected")} className="flex-1 border border-red-200 text-red-600 rounded-lg py-2 text-sm hover:bg-red-50 transition-colors">Reject</button>
+              <button onClick={() => approveInvoice("see notes")} className="flex-1 border border-orange-200 text-orange-600 rounded-lg py-2 text-sm hover:bg-orange-50 transition-colors">See Notes</button>
+              <button onClick={() => approveInvoice("approved")} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 transition-colors">Approve</button>
             </div>
           </div>
         </Modal>
