@@ -473,7 +473,7 @@ Answer concisely in English. Use USD formatting.`;
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between flex-wrap gap-2">
                 <h2 className="font-medium text-gray-800">Month Comparison by Client</h2>
-                <span className="text-xs text-gray-400">{lastMonthLabel} vs {currentMonthLabel}</span>
+                <span className="text-xs text-gray-400">{currentMonthLabel} vs {nextMonthLabel}</span>
               </div>
               {clients.length === 0 ? (
                 <div className="px-6 py-10 text-center text-gray-300 text-sm">Import your data to see the comparison</div>
@@ -484,8 +484,8 @@ Answer concisely in English. Use USD formatting.`;
                       <th className="px-6 py-3 text-left">Client</th>
                       <th className="px-6 py-3 text-left">Lead</th>
                       <th className="px-6 py-3 text-left">Departments</th>
-                      <th className="px-6 py-3 text-right">{lastMonthLabel}</th>
                       <th className="px-6 py-3 text-right">{currentMonthLabel}</th>
+                      <th className="px-6 py-3 text-right">{nextMonthLabel}</th>
                       <th className="px-6 py-3 text-right">Change</th>
                       <th className="px-6 py-3 text-left">Invoice</th>
                     </tr>
@@ -500,9 +500,9 @@ Answer concisely in English. Use USD formatting.`;
                           <td className="px-6 py-3 font-medium text-gray-800">{c.name}</td>
                           <td className="px-6 py-3 text-xs text-gray-500">{c.lead || "—"}</td>
                           <td className="px-6 py-3"><div className="flex flex-wrap gap-1">{depts.map(d => <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{d}</span>)}</div></td>
-                          <td className="px-6 py-3 text-right text-gray-500">{fmt(c.lastAmount)}</td>
-                          <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(c.amount)}</td>
-                          <td className={`px-6 py-3 text-right font-medium ${diff >= 0 ? "text-emerald-600" : "text-red-500"}`}>{diff >= 0 ? "+" : ""}{fmt(diff)}</td>
+                          <td className="px-6 py-3 text-right text-gray-500">{fmt(c.amount)}</td>
+                          <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(c.nextAmount)}</td>
+                          <td className={`px-6 py-3 text-right font-medium ${c.nextAmount - c.amount >= 0 ? "text-emerald-600" : "text-red-500"}`}>{c.nextAmount - c.amount >= 0 ? "+" : ""}{fmt(c.nextAmount - c.amount)}</td>
                           <td className="px-6 py-3">{inv && <Badge status={inv.status} />}</td>
                         </tr>
                       );
