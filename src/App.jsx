@@ -459,7 +459,7 @@ Answer concisely in English. Use USD formatting.`;
             <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
               {[
                 { label: `Projected — ${nextMonthLabel || "next month"}`, value: fmt(activeClients.reduce((s, c) => s + c.nextAmount, 0)), sub: `${activeClients.length} active clients` },
-                { label: `Invoiced — ${lastMonthLabel || "last month"}`, value: fmt(totalLast), sub: "actual billed" },
+                { label: `Invoiced — ${currentMonthLabel || "this month"}`, value: fmt(totalProjected), sub: "actual billed" },
                 { label: "Month-over-Month", value: (activeClients.reduce((s, c) => s + c.nextAmount, 0) - totalLast >= 0 ? "+" : "") + fmt(activeClients.reduce((s, c) => s + c.nextAmount, 0) - totalLast), sub: activeClients.reduce((s, c) => s + c.nextAmount, 0) >= totalLast ? "increase" : "decrease", color: activeClients.reduce((s, c) => s + c.nextAmount, 0) >= totalLast ? "text-emerald-600" : "text-red-500" },
                 { label: "Pending Approval", value: pendingCount, sub: `${approvedCount} approved` },
               ].map(c => (
@@ -491,7 +491,7 @@ Answer concisely in English. Use USD formatting.`;
                     </tr>
                   </thead>
                   <tbody>
-                    {activeClients.map(c => {
+                    {activeClients.filter(c => c.amount > 0 || c.nextAmount > 0).map(c => {
                       const diff = c.amount - c.lastAmount;
                       const inv = invoices.find(i => i.clientId === c.id);
                       const depts = [...new Set(c.lines.map(l => l.department))].filter(Boolean);
