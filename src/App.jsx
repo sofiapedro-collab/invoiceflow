@@ -322,9 +322,13 @@ export default function App() {
 
   // Invoice approvals filtered
   const [filterLead, setFilterLead] = useState("all");
+  const [filterStatus, setFilterStatus] = useState("all");
   const approvalBase = invoices.filter(i => i.nextAmount > 0);
   const approvalLeads = ["all", ...new Set(approvalBase.map(i => i.lead).filter(Boolean))];
-  const filteredApprovals = filterLead === "all" ? approvalBase : approvalBase.filter(i => i.lead === filterLead);
+  const approvalStatuses = ["all", "pending", "approved", "see notes", "rejected", "sent"];
+  const filteredApprovals = approvalBase
+    .filter(i => filterLead === "all" || i.lead === filterLead)
+    .filter(i => filterStatus === "all" || i.status === filterStatus);
 
   async function sendAI() {
     if (!aiInput.trim() || aiLoading) return;
@@ -612,20 +616,32 @@ Answer concisely in English. Use USD formatting.`;
                 <h2 className="font-medium text-gray-800">Invoice Approvals</h2>
                 <p className="text-xs text-gray-400 mt-0.5">Next month forecast ({nextMonthLabel || "upcoming"}) vs current month ({currentMonthLabel || "current"})</p>
               </div>
-              <div className="flex items-center gap-3 flex-wrap">
-                <div className="flex gap-1 flex-wrap">
-                  {approvalLeads.map(l => (
-                    <button key={l} onClick={() => setFilterLead(l)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${filterLead === l ? "bg-gray-900 text-white" : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50"}`}>
-                      {l === "all" ? "All leads" : l}
-                    </button>
-                  ))}
+                              <div className="flex flex-col gap-2 items-end">
+                  <div className="flex gap-1 flex-wrap justify-end">
+                    {approvalLeads.map(l => (
+                      <button key={l} onClick={() => setFilterLead(l)}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${filterLead === l ? "bg-gray-900 text-white" : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50"}`}>
+                        {l === "all" ? "All leads" : l}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex gap-1 flex-wrap justify-end">
+                    {approvalStatuses.map(s => {
+                      const colors = { all: "bg-gray-900 text-white", pending: "bg-amber-500 text-white", approved: "bg-blue-600 text-white", "see notes": "bg-orange-500 text-white", rejected: "bg-red-500 text-white", sent: "bg-purple-600 text-white" };
+                      const inactive = "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50";
+                      return (
+                        <button key={s} onClick={() => setFilterStatus(s)}
+                          className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${filterStatus === s ? (colors[s] || "bg-gray-900 text-white") : inactive}`}>
+                          {s === "all" ? "All statuses" : s}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex gap-2 text-xs">
+                    <span className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full">{filteredApprovals.filter(i => i.status === "pending").length} pending</span>
+                    <span className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full">{filteredApprovals.filter(i => i.status === "approved").length} approved</span>
+                  </div>
                 </div>
-                <div className="flex gap-2 text-xs">
-                  <span className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full">{filteredApprovals.filter(i => i.status === "pending").length} pending</span>
-                  <span className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full">{filteredApprovals.filter(i => i.status === "approved").length} approved</span>
-                </div>
-              </div>
             </div>
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               {filteredApprovals.length === 0 ? (
