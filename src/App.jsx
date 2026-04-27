@@ -180,7 +180,21 @@ export default function App() {
     setSaving(true);
     try {
       const saved = await loadFromSupabase();
-      if (saved) await saveToSupabase({ ...saved, clients: newClients, invoices: newInvoices, curColKey, nextColKey });
+      const base = saved || {};
+      await saveToSupabase({
+        ...base,
+        clients: newClients,
+        invoices: newInvoices,
+        rawRows: base.rawRows || rawRows,
+        approvers: base.approvers || approvers,
+        monthCols: base.monthCols || monthCols,
+        curColKey: base.curColKey || curColKey,
+        nextColKey: base.nextColKey || nextColKey,
+        currentMonthLabel: base.currentMonthLabel || currentMonthLabel,
+        lastMonthLabel: base.lastMonthLabel || lastMonthLabel,
+        nextMonthLabel: base.nextMonthLabel || nextMonthLabel,
+        selectedMonth: base.selectedMonth || selectedMonth,
+      });
     } catch (_) {}
     setSaving(false);
   }
@@ -409,7 +423,7 @@ Answer concisely in English. Use USD formatting.`;
                 const saved = await loadFromSupabase();
                 if (saved) await saveToSupabase({ ...saved, invoices: updatedInvoices, clients: updatedClients, curColKey: newKey, nextColKey: next?.h || "", currentMonthLabel: curLabel, lastMonthLabel: prevLabel, nextMonthLabel: nextLabel, selectedMonth: newKey });
               }} className="text-xs font-medium text-gray-700 outline-none bg-transparent">
-                {monthCols.map(c => <option key={c.h} value={c.h}>{formatMonthLabel(c.d)}</option>)}
+                {monthCols.map(c => { const d = parseColDate(c.h); return <option key={c.h} value={c.h}>{d ? formatMonthLabel(d) : c.h}</option>; })}
               </select>
             </div>
           )}
