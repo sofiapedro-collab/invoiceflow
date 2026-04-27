@@ -230,9 +230,9 @@ export default function App() {
       const cols = getMonthCols(headers);
       if (!cols.length) throw new Error("No month columns found. Expected format: 01/01/2025 or Jan 2025.");
 
-      const now = new Date();
-      let curCol = cols.find(c => c.d.getMonth() === now.getMonth() && c.d.getFullYear() === now.getFullYear());
-      if (!curCol) curCol = cols[cols.length - 1];
+      // Use manually selected billing month if set, otherwise fall back to last col
+      const savedCurKey = curColKey;
+      let curCol = (savedCurKey && cols.find(c => c.h === savedCurKey)) || cols[cols.length - 2] || cols[cols.length - 1];
       const curIdx = cols.indexOf(curCol);
       const prevCol = curIdx > 0 ? cols[curIdx - 1] : null;
       const nextCol = curIdx < cols.length - 1 ? cols[curIdx + 1] : null;
@@ -274,13 +274,15 @@ export default function App() {
         multiDept: new Set(g.lines.map(l => l.department).filter(Boolean)).size > 1,
       }));
 
+      // Preserve existing statuses — never overwrite non-pending statuses
       const invoiceList = clientList.map((c, i) => {
         const existing = invoices.find(p => p.clientName === c.name);
+        const preserveStatus = existing && existing.status !== "pending";
         return {
           id: i + 1, clientId: c.id, clientName: c.name,
           amount: c.amount, lastAmount: c.lastAmount, nextAmount: c.nextAmount,
           approver: existing?.approver || approverNames[0] || "", lead: c.lead,
-          status: existing?.status || "pending",
+          status: preserveStatus ? existing.status : (existing?.status || "pending"),
           comment: existing?.comment || "",
           month: curLabel, monthCol: curCol.h, nextMonthCol: nextCol?.h || "",
           lines: c.lines, multiDept: c.multiDept,
@@ -371,6 +373,46 @@ Answer concisely in English. Use USD formatting.`;
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {saving && <span className="text-xs text-gray-400">Saving...</span>}
+          {monthCols.length > 0 && (
+            <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-1.5">
+              <span className="text-xs text-gray-400">Billing month:</span>
+              <select value={curColKey} onChange={async e => {
+                const newKey = e.target.value;
+                const cols = monthCols;
+                const idx = cols.findIndex(c => c.h === newKey);
+                const cur = cols[idx];
+                const prev = idx > 0 ? cols[idx - 1] : null;
+                const next = idx < cols.length - 1 ? cols[idx + 1] : null;
+                const curLabel = formatMonthLabel(cur.d);
+                const prevLabel = prev ? formatMonthLabel(prev.d) : "";
+                const nextLabel = next ? formatMonthLabel(next.d) : "";
+                setCurColKey(newKey);
+                setNextColKey(next?.h || "");
+                setCurrentMonthLabel(curLabel);
+                setLastMonthLabel(prevLabel);
+                setNextMonthLabel(nextLabel);
+                setSelectedMonth(newKey);
+                // Update invoice month references without touching statuses
+                const updatedInvoices = invoices.map(inv => ({
+                  ...inv, month: curLabel, monthCol: newKey, nextMonthCol: next?.h || "",
+                  amount: clients.find(c => c.id === inv.clientId)?.lines?.reduce((s, l) => s + (l.amounts[newKey] || 0), 0) ?? inv.amount,
+                  nextAmount: clients.find(c => c.id === inv.clientId)?.lines?.reduce((s, l) => s + (l.amounts[next?.h || ""] || 0), 0) ?? inv.nextAmount,
+                }));
+                const updatedClients = clients.map(c => ({
+                  ...c,
+                  amount: c.lines?.reduce((s, l) => s + (l.amounts[newKey] || 0), 0) ?? c.amount,
+                  nextAmount: c.lines?.reduce((s, l) => s + (l.amounts[next?.h || ""] || 0), 0) ?? c.nextAmount,
+                  lastAmount: c.lines?.reduce((s, l) => s + (l.amounts[prev?.h || ""] || 0), 0) ?? c.lastAmount,
+                }));
+                setInvoices(updatedInvoices);
+                setClients(updatedClients);
+                const saved = await loadFromSupabase();
+                if (saved) await saveToSupabase({ ...saved, invoices: updatedInvoices, clients: updatedClients, curColKey: newKey, nextColKey: next?.h || "", currentMonthLabel: curLabel, lastMonthLabel: prevLabel, nextMonthLabel: nextLabel, selectedMonth: newKey });
+              }} className="text-xs font-medium text-gray-700 outline-none bg-transparent">
+                {monthCols.map(c => <option key={c.h} value={c.h}>{formatMonthLabel(c.d)}</option>)}
+              </select>
+            </div>
+          )}
           {approvedCount > 0 && (
             <button onClick={() => {
               const approved = invoices.filter(i => i.status === "approved");
