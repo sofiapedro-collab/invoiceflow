@@ -107,7 +107,21 @@ function parseColDate(header) {
   if (m) { const mo = months.indexOf(m[1].toLowerCase()); if (mo >= 0) return new Date(Number(m[2]), mo, 1); }
   return null;
 }
-function formatMonthLabel(d) { return d.toLocaleString("en-US", { month: "short", year: "numeric" }); }
+function formatMonthLabel(d) {
+  if (!d || !(d instanceof Date) || isNaN(d)) return "";
+  return d.toLocaleString("en-US", { month: "short", year: "numeric" });
+}
+function labelFromKey(key) {
+  if (!key) return "";
+  const d = parseColDate(key);
+  return d ? formatMonthLabel(d) : key;
+}
+function nextLabelFromKey(key, cols) {
+  if (!key || !cols?.length) return "";
+  const idx = cols.findIndex(c => c.h === key);
+  if (idx < 0 || idx >= cols.length - 1) return "";
+  return labelFromKey(cols[idx + 1].h);
+}
 function parsePaste(text) { return text.trim().split("\n").map(r => r.split("\t").map(c => c.trim())); }
 function rowsToObjects(rows) {
   if (rows.length < 2) return { objects: [], headers: [] };
@@ -670,7 +684,7 @@ Answer concisely in English. Use USD formatting.`;
             <div className="flex items-center justify-between flex-wrap gap-2">
               <div>
                 <h2 className="font-medium text-gray-800">Invoice Approvals</h2>
-                <p className="text-xs text-gray-400 mt-0.5">Next month forecast ({nextMonthLabel || "upcoming"}) vs current month ({currentMonthLabel || "current"})</p>
+                <p className="text-xs text-gray-400 mt-0.5">Next month forecast ({nextLabelFromKey(curColKey, monthCols) || nextMonthLabel || "upcoming"}) vs current month ({labelFromKey(curColKey) || currentMonthLabel || "current"})</p>
               </div>
                               <div className="flex flex-col gap-2 items-end">
                   <div className="flex gap-1 flex-wrap justify-end">
@@ -708,8 +722,8 @@ Answer concisely in English. Use USD formatting.`;
                     <th className="px-6 py-3 text-left">Client</th>
                     <th className="px-6 py-3 text-left">Lead</th>
                     <th className="px-6 py-3 text-left">Departments</th>
-                    <th className="px-6 py-3 text-right">{currentMonthLabel || "Current"}</th>
-                    <th className="px-6 py-3 text-right">{nextMonthLabel || "Next Month"}</th>
+                    <th className="px-6 py-3 text-right">{labelFromKey(curColKey) || currentMonthLabel || "Current"}</th>
+                    <th className="px-6 py-3 text-right">{nextLabelFromKey(curColKey, monthCols) || nextMonthLabel || "Next Month"}</th>
                     <th className="px-6 py-3 text-right">Change</th>
                     <th className="px-6 py-3 text-left">Status</th>
                     <th className="px-6 py-3 text-left">Comment</th>
