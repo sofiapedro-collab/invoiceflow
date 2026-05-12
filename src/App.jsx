@@ -225,7 +225,8 @@ export default function App() {
       try {
         const d = await loadFromSupabase();
         if (d?.clients?.length || d?.rawRows?.length) {
-          const loadedCols = d.monthCols || [];
+          // Re-hydrate Date objects lost during JSON serialization
+          const loadedCols = (d.monthCols || []).map(c => ({ ...c, d: parseColDate(c.h) })).filter(c => c.d);
           const initCtx = getMonthContext(loadedCols, d.curColKey || "");
           setRawRows(d.rawRows || []);
           setClients(d.clients || []);
@@ -298,7 +299,7 @@ export default function App() {
       const clientRows = parsePaste(clientPaste);
       const { objects, headers } = rowsToObjects(clientRows);
       if (!objects.length) throw new Error("No data found. Make sure to include the header row.");
-      const cols = getMonthCols(headers);
+      const cols = getMonthCols(headers).map(c => ({ ...c, d: parseColDate(c.h) })).filter(c => c.d);
       if (!cols.length) throw new Error("No month columns found. Expected format: 01/01/2025 or Jan 2025.");
 
       const importCtx = getMonthContext(cols, curColKey);
