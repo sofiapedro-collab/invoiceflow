@@ -1,7 +1,9 @@
+
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
-const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJodHB5Y3FlZ29na3Fzb2R2eWtxZmoiLCJyb2xlIjoiYW5vbiIsImlhdCI6MTc3Mzk1NTExNywiZXhwIjoyMDg5NTMxMTE3fQ.Rb5r_9gsNNVIl0e9dqYraYJdDayvunqEMfQ_I8FmfKI";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhweWNxZWdvZ2txc29kdnlrcWZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5NTUxMTcsImV4cCI6MjA4OTUzMTExN30.Rb5r_9gsNNVIl0e9dqYraYJdDayvunqEMfQ_I8FmfKI";
+const LOCAL_STORAGE_KEY = "invoiceflow_data_backup";
 
 async function loadFromSupabase() {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.main&select=data`, {
@@ -24,6 +26,18 @@ async function saveToSupabase(data) {
     body: JSON.stringify({ id: "main", data, updated_at: new Date().toISOString() }),
   });
   if (!res.ok) throw new Error(`Supabase save failed: ${res.status} ${await res.text()}`);
+}
+
+function loadLocalBackup() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || "null");
+  } catch {
+    return null;
+  }
+}
+
+function saveLocalBackup(data) {
+  localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
 }
 
 function fmt(n) {
@@ -465,11 +479,13 @@ export default function App() {
   async function persistSnapshot(overrides = {}) {
     setSaving(true);
     setSaveError("");
+    const snapshot = buildSnapshot(overrides);
+    saveLocalBackup(snapshot);
     try {
-      await saveToSupabase(buildSnapshot(overrides));
+      await saveToSupabase(snapshot);
     } catch (error) {
       console.error(error);
-      setSaveError("Save failed. Refreshing now may lose the latest changes.");
+      setSaveError("Saved locally. Supabase save failed.");
     }
     setSaving(false);
   }
@@ -477,7 +493,7 @@ export default function App() {
   useEffect(() => {
     async function load() {
       try {
-        const d = await loadFromSupabase();
+        const d = (await loadFromSupabase()) || loadLocalBackup();
         const loadedClients = d?.clients || [];
         if (loadedClients.length || d?.rawRows?.length) {
           const loadedMonthCols = d.monthCols || [];
@@ -499,7 +515,29 @@ export default function App() {
         }
       } catch (error) {
         console.error(error);
-        setSaveError("Could not load saved data from Supabase.");
+        const d = loadLocalBackup();
+        const loadedClients = d?.clients || [];
+        if (loadedClients.length || d?.rawRows?.length) {
+          const loadedMonthCols = d.monthCols || [];
+          const initialContext = getMonthContext(loadedMonthCols, d.curColKey || "");
+          const initialApprovalKey = d.approvalMonthKey || initialContext.curKey || "";
+
+          setRawRows(d.rawRows || []);
+          setClients(loadedClients);
+          setApprovers(d.approvers || []);
+          setApprovalHistory(d.approvalHistory || migrateApprovalHistory(d.invoices));
+          const loadedClosedMonths = normalizeClosedMonths(d.closedMonths || []);
+          setClosedMonths(loadedClosedMonths);
+          setSelectedClosedMonthKey(loadedClosedMonths[loadedClosedMonths.length - 1]?.monthKey || "");
+          setMonthCols(loadedMonthCols);
+          setCurColKey(initialContext.curKey);
+          setApprovalMonthKey(initialApprovalKey);
+          setConnected(true);
+          setSaveError("Loaded local backup. Supabase load failed.");
+          setAiMessages([{ role: "assistant", content: `Local backup loaded: ${loadedClients.length} clients. Supabase needs attention.` }]);
+        } else {
+          setSaveError("Could not load saved data from Supabase.");
+        }
       }
       setStorageLoading(false);
     }
