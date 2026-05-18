@@ -1,3 +1,4 @@
+
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
@@ -332,6 +333,51 @@ function migrateApprovalHistory(legacyInvoices) {
   return history;
 }
 
+function normalizeClosedMonths(value) {
+  return (value || []).map(item => (typeof item === "string" ? { monthKey: item, monthLabel: labelFromKey(item), closedAt: "", invoices: [] } : item));
+}
+
+function buildClosedMonthRecord(monthKey, ctx, invoices) {
+  const snapshotInvoices = (invoices || [])
+    .filter(inv => inv.amount > 0)
+    .map(inv => ({
+      id: inv.id,
+      clientId: inv.clientId,
+      clientName: inv.clientName,
+      lead: inv.lead,
+      approver: inv.approver,
+      status: inv.status,
+      comment: inv.comment,
+      amount: inv.amount,
+      lastAmount: inv.lastAmount,
+      month: inv.month,
+      monthCol: inv.monthCol,
+      previousMonthCol: inv.previousMonthCol,
+      multiDept: inv.multiDept,
+      lines: (inv.lines || [])
+        .filter(line => (line.amounts?.[inv.monthCol] || 0) > 0)
+        .map(line => ({
+          service: line.service,
+          department: line.department,
+          lead: line.lead,
+          amount: line.amounts?.[inv.monthCol] || 0,
+        })),
+    }));
+
+  return {
+    monthKey,
+    monthLabel: ctx.curLabel,
+    previousMonthKey: ctx.prevKey,
+    previousMonthLabel: ctx.prevLabel,
+    closedAt: new Date().toISOString(),
+    total: snapshotInvoices.reduce((sum, inv) => sum + inv.amount, 0),
+    invoiceCount: snapshotInvoices.length,
+    approvedCount: snapshotInvoices.filter(inv => inv.status === "approved").length,
+    sentCount: snapshotInvoices.filter(inv => inv.status === "sent").length,
+    invoices: snapshotInvoices,
+  };
+}
+
 export default function App() {
   const [storageLoading, setStorageLoading] = useState(true);
   const [tab, setTab] = useState("dashboard");
@@ -353,6 +399,7 @@ export default function App() {
   const [approvalMonthKey, setApprovalMonthKey] = useState("");
 
   const [closedMonths, setClosedMonths] = useState([]);
+  const [selectedClosedMonthKey, setSelectedClosedMonthKey] = useState("");
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
 
   const [showApprove, setShowApprove] = useState(null);
@@ -391,6 +438,12 @@ export default function App() {
     () => clients.map(client => buildInvoiceRecord(enrichClientForContext(client, approvalContext), approvalContext, approvalHistory, approvers[0] || "")),
     [clients, approvalContext, approvalHistory, approvers]
   );
+  const closedMonthRecords = useMemo(() => normalizeClosedMonths(closedMonths), [closedMonths]);
+  const closedMonthKeys = useMemo(() => closedMonthRecords.map(month => month.monthKey), [closedMonthRecords]);
+  const selectedClosedMonth = useMemo(
+    () => closedMonthRecords.find(month => month.monthKey === selectedClosedMonthKey) || closedMonthRecords[closedMonthRecords.length - 1] || null,
+    [closedMonthRecords, selectedClosedMonthKey]
+  );
 
   function buildSnapshot(overrides = {}) {
     return {
@@ -401,7 +454,7 @@ export default function App() {
       monthCols: overrides.monthCols ?? monthCols,
       curColKey: overrides.curColKey ?? billingContext.curKey,
       approvalMonthKey: overrides.approvalMonthKey ?? effectiveApprovalMonthKey,
-      closedMonths: overrides.closedMonths ?? closedMonths,
+      closedMonths: overrides.closedMonths ?? closedMonthRecords,
       connected: overrides.connected ?? connected,
     };
   }
@@ -430,7 +483,9 @@ export default function App() {
           setClients(loadedClients);
           setApprovers(d.approvers || []);
           setApprovalHistory(d.approvalHistory || migrateApprovalHistory(d.invoices));
-          setClosedMonths(d.closedMonths || []);
+          const loadedClosedMonths = normalizeClosedMonths(d.closedMonths || []);
+          setClosedMonths(loadedClosedMonths);
+          setSelectedClosedMonthKey(loadedClosedMonths[loadedClosedMonths.length - 1]?.monthKey || "");
           setMonthCols(loadedMonthCols);
           setCurColKey(initialContext.curKey);
           setApprovalMonthKey(initialApprovalKey);
@@ -642,9 +697,14 @@ export default function App() {
 
   async function closeMonth() {
     if (!effectiveApprovalMonthKey) return;
-    const updatedClosed = [...closedMonths, effectiveApprovalMonthKey];
+    if (!canCloseApprovalMonth) return;
+
+    const monthRecord = buildClosedMonthRecord(effectiveApprovalMonthKey, approvalContext, approvalBase);
+    const updatedClosed = [...closedMonthRecords.filter(month => month.monthKey !== effectiveApprovalMonthKey), monthRecord];
     setClosedMonths(updatedClosed);
+    setSelectedClosedMonthKey(effectiveApprovalMonthKey);
     setShowCloseConfirm(false);
+
     const nextKey = approvalContext.nextKey;
     if (nextKey) {
       setApprovalMonthKey(nextKey);
@@ -672,7 +732,9 @@ export default function App() {
 
   const pendingCount = approvalBase.filter(inv => inv.status === "pending").length;
   const approvedCount = approvalBase.filter(inv => inv.status === "approved").length;
-  const isCurrentApprovalMonthClosed = closedMonths.includes(effectiveApprovalMonthKey);
+  const isCurrentApprovalMonthClosed = closedMonthKeys.includes(effectiveApprovalMonthKey);
+  const notApprovedCount = approvalBase.filter(inv => !["approved", "sent"].includes(inv.status)).length;
+  const canCloseApprovalMonth = approvalBase.length > 0 && notApprovedCount === 0;
 
   async function sendInvoiceToQBO(inv) {
     await saveApprovalEntry(inv.approvalMonthKey, inv.clientName, {
@@ -724,7 +786,7 @@ Answer concisely in English. Use USD formatting.`;
     setAiLoading(false);
   }
 
-  const tabs = ["dashboard", "clients", "invoices", "invoice approvals", "ai assistant"];
+  const tabs = ["dashboard", "clients", "invoices", "invoice approvals", "closed months", "ai assistant"];
 
   if (storageLoading) {
     return (
@@ -1161,7 +1223,7 @@ Answer concisely in English. Use USD formatting.`;
                       >
                         {approvalMonthOptions.map(col => (
                           <option key={col.h} value={col.h}>
-                            {formatMonthLabel(col.d)}{closedMonths.includes(col.h) ? " (closed)" : ""}
+                            {formatMonthLabel(col.d)}{closedMonthKeys.includes(col.h) ? " (closed)" : ""}
                           </option>
                         ))}
                       </select>
@@ -1179,8 +1241,14 @@ Answer concisely in English. Use USD formatting.`;
                   ) : (
                     <button
                       onClick={() => setShowCloseConfirm(true)}
-                      disabled={pendingCount > 0}
-                      title={pendingCount > 0 ? `${pendingCount} invoice${pendingCount > 1 ? "s" : ""} still pending` : `Close ${approvalContext.curLabel} and advance to ${approvalContext.nextLabel || "next month"}`}
+                      disabled={!canCloseApprovalMonth}
+                      title={
+                        !approvalBase.length
+                          ? "No invoices to close"
+                          : !canCloseApprovalMonth
+                            ? `${notApprovedCount} invoice${notApprovedCount !== 1 ? "s are" : " is"} not approved yet`
+                            : `Close ${approvalContext.curLabel} and advance to ${approvalContext.nextLabel || "next month"}`
+                      }
                       className="px-3 py-2 rounded-lg text-xs font-medium bg-gray-900 text-white hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                       Close Month →
@@ -1348,6 +1416,102 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         )}
 
+        {tab === "closed months" && (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <h2 className="font-medium text-gray-800">Closed Months</h2>
+                <p className="text-xs text-gray-400 mt-0.5">Review exactly what was approved and billed when a month was closed.</p>
+              </div>
+              {closedMonthRecords.length > 0 && (
+                <select
+                  value={selectedClosedMonth?.monthKey || ""}
+                  onChange={e => setSelectedClosedMonthKey(e.target.value)}
+                  className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600 bg-white"
+                >
+                  {closedMonthRecords.map(month => (
+                    <option key={month.monthKey} value={month.monthKey}>
+                      {month.monthLabel || labelFromKey(month.monthKey)}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            {!selectedClosedMonth ? (
+              <div className="bg-white rounded-2xl border border-gray-100 px-6 py-10 text-center text-gray-300 text-sm">
+                No closed months yet. Once all approvals are done, close the month from Invoice Approvals.
+              </div>
+            ) : (
+              <>
+                <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+                  {[
+                    {
+                      label: "Closed month",
+                      value: selectedClosedMonth.monthLabel || labelFromKey(selectedClosedMonth.monthKey),
+                      sub: selectedClosedMonth.closedAt ? new Date(selectedClosedMonth.closedAt).toLocaleDateString() : "saved",
+                    },
+                    { label: "Billed total", value: fmt(selectedClosedMonth.total), sub: `${selectedClosedMonth.invoiceCount || 0} invoices` },
+                    { label: "Approved", value: selectedClosedMonth.approvedCount || 0, sub: "approval done" },
+                    { label: "Sent", value: selectedClosedMonth.sentCount || 0, sub: "sent to QBO" },
+                  ].map(card => (
+                    <div key={card.label} className="bg-white rounded-2xl p-5 border border-gray-100">
+                      <p className="text-xs text-gray-400 mb-1">{card.label}</p>
+                      <p className="text-2xl font-semibold text-gray-900">{card.value}</p>
+                      <p className="text-xs text-gray-400 mt-1">{card.sub}</p>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+                  <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
+                    <h2 className="font-medium text-gray-800">Billed Invoices</h2>
+                    <span className="text-xs text-gray-400">{selectedClosedMonth.monthLabel || labelFromKey(selectedClosedMonth.monthKey)}</span>
+                  </div>
+                  {!selectedClosedMonth.invoices?.length ? (
+                    <div className="px-6 py-10 text-center text-gray-300 text-sm">No invoices were captured in this close.</div>
+                  ) : (
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-xs text-gray-400 border-b border-gray-50">
+                          <th className="px-6 py-3 text-left">Client</th>
+                          <th className="px-6 py-3 text-left">Lead</th>
+                          <th className="px-6 py-3 text-right">Amount</th>
+                          <th className="px-6 py-3 text-left">Status</th>
+                          <th className="px-6 py-3 text-left">Approver</th>
+                          <th className="px-6 py-3 text-left">Comment</th>
+                          <th className="px-6 py-3"></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {selectedClosedMonth.invoices.map(inv => (
+                          <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                            <td className="px-6 py-3 font-medium text-gray-800">{inv.clientName}</td>
+                            <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
+                            <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.amount)}</td>
+                            <td className="px-6 py-3">
+                              <Badge status={inv.status} />
+                            </td>
+                            <td className="px-6 py-3 text-xs text-gray-500">{inv.approver || "—"}</td>
+                            <td className="px-6 py-3 text-gray-400 text-xs italic">{inv.comment || "—"}</td>
+                            <td className="px-6 py-3 text-right">
+                              {!!inv.lines?.length && (
+                                <button onClick={() => setShowInvoiceDetail(inv)} className="text-xs text-blue-500 hover:underline">
+                                  View {inv.lines.length} line{inv.lines.length > 1 ? "s" : ""}
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         {tab === "ai assistant" && (
           <div className="bg-white rounded-2xl border border-gray-100 flex flex-col" style={{ height: "520px" }}>
             <div className="px-6 py-4 border-b border-gray-50">
@@ -1389,12 +1553,12 @@ Answer concisely in English. Use USD formatting.`;
         <Modal title="Close Month" onClose={() => setShowCloseConfirm(false)}>
           <div className="space-y-4">
             <p className="text-sm text-gray-600">
-              Close <strong>{approvalContext.curLabel}</strong>? All {approvalBase.length} approval{approvalBase.length !== 1 ? "s" : ""} will be locked and cannot be changed.
+              Close <strong>{approvalContext.curLabel}</strong>? All {approvalBase.length} approval{approvalBase.length !== 1 ? "s" : ""} will be locked and the billed invoice snapshot will be saved.
               {approvalContext.nextKey && (
                 <span> The billing and approval month will advance to <strong>{approvalContext.nextLabel}</strong>.</span>
               )}
             </p>
-            <p className="text-xs text-gray-400">You can still view the closed month's approvals at any time by selecting it in the dropdown.</p>
+            <p className="text-xs text-gray-400">You can review the closed month later from the Closed Months tab, even if the imported sheet changes.</p>
             <div className="flex gap-3 pt-2">
               <button onClick={() => setShowCloseConfirm(false)} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
                 Cancel
@@ -1548,14 +1712,14 @@ Answer concisely in English. Use USD formatting.`;
                 </tr>
               </thead>
               <tbody>
-                {showInvoiceDetail.lines?.filter(line => (line.amounts[showInvoiceDetail.monthCol] || 0) > 0).map((line, idx) => (
+                {showInvoiceDetail.lines?.filter(line => (line.amount ?? line.amounts?.[showInvoiceDetail.monthCol] ?? 0) > 0).map((line, idx) => (
                   <tr key={idx} className="border-b border-gray-50">
                     <td className="py-2 text-gray-700">{line.service}</td>
                     <td className="py-2">
                       <span className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{line.department}</span>
                     </td>
                     <td className="py-2 text-xs text-gray-500">{line.lead || "—"}</td>
-                    <td className="py-2 text-right font-medium text-gray-800">{fmt(line.amounts[showInvoiceDetail.monthCol])}</td>
+                    <td className="py-2 text-right font-medium text-gray-800">{fmt(line.amount ?? line.amounts?.[showInvoiceDetail.monthCol])}</td>
                   </tr>
                 ))}
               </tbody>
