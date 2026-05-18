@@ -1,4 +1,3 @@
-
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
@@ -8,20 +7,23 @@ async function loadFromSupabase() {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.main&select=data`, {
     headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
   });
+  if (!res.ok) throw new Error(`Supabase load failed: ${res.status}`);
   const rows = await res.json();
   return rows?.[0]?.data || null;
 }
 
 async function saveToSupabase(data) {
-  await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.main`, {
-    method: "PATCH",
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?on_conflict=id`, {
+    method: "POST",
     headers: {
       apikey: SUPABASE_KEY,
       Authorization: `Bearer ${SUPABASE_KEY}`,
       "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates",
     },
-    body: JSON.stringify({ data, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ id: "main", data, updated_at: new Date().toISOString() }),
   });
+  if (!res.ok) throw new Error(`Supabase save failed: ${res.status} ${await res.text()}`);
 }
 
 function fmt(n) {
@@ -408,6 +410,7 @@ export default function App() {
   const [qboConnected, setQboConnected] = useState(false);
   const [qboSyncing, setQboSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
 
   const [aiMessages, setAiMessages] = useState([
     { role: "assistant", content: "Hi! Import your data from Google Sheets and then ask me anything about your clients, invoices, or monthly performance." },
@@ -461,10 +464,12 @@ export default function App() {
 
   async function persistSnapshot(overrides = {}) {
     setSaving(true);
+    setSaveError("");
     try {
       await saveToSupabase(buildSnapshot(overrides));
-    } catch (_) {
-      // no-op
+    } catch (error) {
+      console.error(error);
+      setSaveError("Save failed. Refreshing now may lose the latest changes.");
     }
     setSaving(false);
   }
@@ -492,8 +497,9 @@ export default function App() {
           setConnected(true);
           setAiMessages([{ role: "assistant", content: `Data loaded: ${loadedClients.length} clients. Ask me anything!` }]);
         }
-      } catch (_) {
-        // no-op
+      } catch (error) {
+        console.error(error);
+        setSaveError("Could not load saved data from Supabase.");
       }
       setStorageLoading(false);
     }
@@ -805,6 +811,7 @@ Answer concisely in English. Use USD formatting.`;
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {saving && <span className="text-xs text-gray-400">Saving...</span>}
+          {saveError && <span className="text-xs font-medium text-red-500">{saveError}</span>}
 
           {monthCols.length > 0 && (
             <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-1.5">
