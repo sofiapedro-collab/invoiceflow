@@ -233,6 +233,28 @@ function getMonthCols(headers) {
     .sort((a, b) => a.d - b.d);
 }
 
+function normalizeMonthCols(savedCols, savedClients = []) {
+  const fromSaved = (savedCols || [])
+    .map((col, idx) => ({ h: col.h, i: col.i ?? idx, d: parseColDate(col.h) }))
+    .filter(col => col.h && col.d);
+
+  if (fromSaved.length) return fromSaved.sort((a, b) => a.d - b.d);
+
+  const keys = new Set();
+  (savedClients || []).forEach(client => {
+    (client.lines || []).forEach(line => {
+      Object.keys(line.amounts || {}).forEach(key => {
+        if (parseColDate(key)) keys.add(key);
+      });
+    });
+  });
+
+  return [...keys]
+    .map((h, i) => ({ h, i, d: parseColDate(h) }))
+    .filter(col => col.d)
+    .sort((a, b) => a.d - b.d);
+}
+
 function getMonthContext(cols, key) {
   if (!cols.length) {
     return {
@@ -468,7 +490,7 @@ export default function App() {
       clients: overrides.clients ?? clients,
       approvers: overrides.approvers ?? approvers,
       approvalHistory: overrides.approvalHistory ?? approvalHistory,
-      monthCols: overrides.monthCols ?? monthCols,
+      monthCols: (overrides.monthCols ?? monthCols).map((col, idx) => ({ h: col.h, i: col.i ?? idx })),
       curColKey: overrides.curColKey ?? billingContext.curKey,
       approvalMonthKey: overrides.approvalMonthKey ?? effectiveApprovalMonthKey,
       closedMonths: overrides.closedMonths ?? closedMonthRecords,
@@ -496,7 +518,7 @@ export default function App() {
         const d = (await loadFromSupabase()) || loadLocalBackup();
         const loadedClients = d?.clients || [];
         if (loadedClients.length || d?.rawRows?.length) {
-          const loadedMonthCols = d.monthCols || [];
+          const loadedMonthCols = normalizeMonthCols(d.monthCols || [], loadedClients);
           const initialContext = getMonthContext(loadedMonthCols, d.curColKey || "");
           const initialApprovalKey = d.approvalMonthKey || initialContext.curKey || "";
 
@@ -518,7 +540,7 @@ export default function App() {
         const d = loadLocalBackup();
         const loadedClients = d?.clients || [];
         if (loadedClients.length || d?.rawRows?.length) {
-          const loadedMonthCols = d.monthCols || [];
+          const loadedMonthCols = normalizeMonthCols(d.monthCols || [], loadedClients);
           const initialContext = getMonthContext(loadedMonthCols, d.curColKey || "");
           const initialApprovalKey = d.approvalMonthKey || initialContext.curKey || "";
 
