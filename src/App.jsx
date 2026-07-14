@@ -1,4 +1,3 @@
-
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
@@ -416,6 +415,83 @@ function buildClosedMonthRecord(monthKey, ctx, invoices) {
   };
 }
 
+// ---------- Contract parsing helpers ----------
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1]);
+    reader.onerror = () => reject(new Error("Could not read the file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function monthKeyToYearMonth(key) {
+  const d = parseColDate(key);
+  if (!d) return null;
+  return d.getFullYear() * 12 + d.getMonth();
+}
+
+function yearMonthFromString(s) {
+  // Accepts "YYYY-MM" or "YYYY-MM-DD"
+  const m = String(s || "").match(/^(\d{4})-(\d{2})/);
+  if (!m) return null;
+  return Number(m[1]) * 12 + (Number(m[2]) - 1);
+}
+
+async function parseContractWithAI(file) {
+  const base64Data = await fileToBase64(file);
+  const system = `You are a contract data extractor for a service agency's invoicing system.
+Read the attached contract and extract the billing details.
+Respond ONLY with a valid JSON object, no markdown fences, no preamble, with exactly these keys:
+{
+  "clientName": string,            // the client / counterparty company name
+  "service": string,               // short description of the contracted service
+  "department": string,            // department if identifiable, otherwise ""
+  "monthlyFee": number,            // the fixed monthly fee as a plain number, no currency symbols
+  "currency": string,              // e.g. "USD"
+  "startDate": string,             // contract start in YYYY-MM format, "" if not found
+  "endDate": string,               // contract end in YYYY-MM format, "" if open-ended or not found
+  "notes": string                  // anything relevant for billing: setup fees, escalations, payment terms
+}
+If the fee is stated annually, divide by 12. If multiple fees exist, use the recurring monthly fixed fee.`;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      system,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } },
+            { type: "text", text: "Extract the billing details from this contract as JSON." },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const data = await res.json();
+  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("\n") || "";
+  const clean = text.replace(/```json|```/g, "").trim();
+  const parsed = JSON.parse(clean);
+
+  return {
+    clientName: String(parsed.clientName || "").trim(),
+    service: String(parsed.service || "").trim(),
+    department: String(parsed.department || "").trim(),
+    monthlyFee: Number(parsed.monthlyFee) || 0,
+    currency: String(parsed.currency || "USD").trim(),
+    startDate: String(parsed.startDate || "").trim(),
+    endDate: String(parsed.endDate || "").trim(),
+    notes: String(parsed.notes || "").trim(),
+  };
+}
+
 export default function App() {
   const [storageLoading, setStorageLoading] = useState(true);
   const [tab, setTab] = useState("dashboard");
@@ -447,6 +523,14 @@ export default function App() {
   const [qboSyncing, setQboSyncing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+
+  // Contract upload state
+  const [showContract, setShowContract] = useState(false);
+  const [contractStep, setContractStep] = useState("upload"); // upload | review
+  const [contractFile, setContractFile] = useState(null);
+  const [contractParsing, setContractParsing] = useState(false);
+  const [contractError, setContractError] = useState("");
+  const [contractResult, setContractResult] = useState(null);
 
   const [aiMessages, setAiMessages] = useState([
     { role: "assistant", content: "Hi! Import your data from Google Sheets and then ask me anything about your clients, invoices, or monthly performance." },
@@ -623,6 +707,104 @@ export default function App() {
     await persistSnapshot({ clients: updatedClients, connected: true });
   }
 
+  // ---------- Contract flow ----------
+
+  function resetContractModal() {
+    setShowContract(false);
+    setContractStep("upload");
+    setContractFile(null);
+    setContractParsing(false);
+    setContractError("");
+    setContractResult(null);
+  }
+
+  async function handleParseContract() {
+    if (!contractFile) return;
+    setContractParsing(true);
+    setContractError("");
+    try {
+      const result = await parseContractWithAI(contractFile);
+      if (!result.clientName) throw new Error("Could not identify the client name in the contract.");
+      if (!result.monthlyFee) throw new Error("Could not identify a monthly fixed fee in the contract.");
+      setContractResult(result);
+      setContractStep("review");
+    } catch (e) {
+      setContractError(e.message || "Could not parse the contract. Try another file.");
+    }
+    setContractParsing(false);
+  }
+
+  function buildContractAmounts(result) {
+    const startYM = yearMonthFromString(result.startDate);
+    const endYM = yearMonthFromString(result.endDate);
+    const amounts = {};
+    monthCols.forEach(col => {
+      const ym = monthKeyToYearMonth(col.h);
+      if (ym === null) return;
+      const afterStart = startYM === null || ym >= startYM;
+      const beforeEnd = endYM === null || ym <= endYM;
+      amounts[col.h] = afterStart && beforeEnd ? result.monthlyFee : 0;
+    });
+    return amounts;
+  }
+
+  async function applyContract() {
+    if (!contractResult || !monthCols.length) return;
+
+    const result = contractResult;
+    const amounts = buildContractAmounts(result);
+    const key = makeClientKey(result.clientName);
+    const existing = clients.find(c => makeClientKey(c.name) === key);
+    const lead = existing?.lead || getDefaultLead(result.department) || "";
+    const contractMeta = {
+      fileName: contractFile?.name || "contract.pdf",
+      monthlyFee: result.monthlyFee,
+      currency: result.currency,
+      startDate: result.startDate,
+      endDate: result.endDate,
+      notes: result.notes,
+      parsedAt: new Date().toISOString(),
+    };
+
+    const newLine = {
+      _id: `contract-${Date.now()}`,
+      clientName: result.clientName,
+      service: result.service || "Fixed fee (contract)",
+      department: result.department || "",
+      lead,
+      fromContract: true,
+      amounts,
+    };
+
+    let updatedClients;
+    if (existing) {
+      updatedClients = clients.map(c =>
+        c.id === existing.id ? { ...c, contract: contractMeta, lines: [...(c.lines || []), newLine] } : c
+      );
+    } else {
+      updatedClients = [
+        ...clients,
+        {
+          id: `contract-${Date.now()}`,
+          name: result.clientName,
+          status: "active",
+          lead,
+          manual: true,
+          contract: contractMeta,
+          lines: [newLine],
+        },
+      ];
+    }
+
+    setClients(updatedClients);
+    resetContractModal();
+    setAiMessages(prev => [
+      ...prev,
+      { role: "assistant", content: `Contract loaded for ${result.clientName}: ${fmt(result.monthlyFee)} / month${result.startDate ? `, from ${result.startDate}` : ""}${result.endDate ? ` to ${result.endDate}` : ""}. Billing was added automatically.` },
+    ]);
+    await persistSnapshot({ clients: updatedClients, connected: true });
+  }
+
   async function processImport() {
     setImportError("");
 
@@ -683,13 +865,15 @@ export default function App() {
       const importedClients = Object.values(grouped).map((group, idx) => {
         const existing = existingByKey[makeClientKey(group.name)];
         const lead = resolveLead(group.name, group.lines[0]?.department || "", existing?.lead);
+        const contractLines = (existing?.lines || []).filter(line => line.fromContract);
         return {
           id: existing?.id || `import-${idx + 1}`,
           name: group.name,
           status: existing?.status || "active",
           lead,
           manual: false,
-          lines: group.lines.map(line => ({ ...line, lead: line.lead || lead })),
+          contract: existing?.contract,
+          lines: [...group.lines.map(line => ({ ...line, lead: line.lead || lead })), ...contractLines],
         };
       });
 
@@ -826,7 +1010,7 @@ export default function App() {
     setAiLoading(true);
 
     const ctx = `You are a finance assistant for a service business agency.
-CLIENTS: ${JSON.stringify(scopedClients.map(c => ({ name: c.name, lead: c.lead, projectedAmount: c.amount, previousAmount: c.lastAmount, nextAmount: c.nextAmount })))}
+CLIENTS: ${JSON.stringify(scopedClients.map(c => ({ name: c.name, lead: c.lead, projectedAmount: c.amount, previousAmount: c.lastAmount, nextAmount: c.nextAmount, hasContract: !!c.contract, contract: c.contract ? { monthlyFee: c.contract.monthlyFee, startDate: c.contract.startDate, endDate: c.contract.endDate } : null })))}
 INVOICES: ${JSON.stringify(billingInvoices.map(i => ({ client: i.clientName, lead: i.lead, amount: i.amount, status: i.status })))}
 PROJECTED MONTH: ${currentMonthLabel}, PREVIOUS MONTH: ${lastMonthLabel}, NEXT MONTH: ${nextMonthLabel}
 TOTAL PROJECTED MONTH: ${fmt(totalProjected)}, TOTAL PREVIOUS MONTH: ${fmt(totalLast)}, TOTAL NEXT MONTH: ${fmt(totalNext)}
@@ -837,7 +1021,7 @@ Answer concisely in English. Use USD formatting.`;
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "claude-sonnet-4-20250514",
+          model: "claude-sonnet-4-6",
           max_tokens: 1000,
           system: ctx,
           messages: [{ role: "user", content: userMsg }],
@@ -894,6 +1078,19 @@ Answer concisely in English. Use USD formatting.`;
               </select>
             </div>
           )}
+
+          <button
+            onClick={() => {
+              setShowContract(true);
+              setContractStep("upload");
+              setContractError("");
+              setContractResult(null);
+              setContractFile(null);
+            }}
+            className="px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+          >
+            Upload Contract
+          </button>
 
           {approvedCount > 0 && (
             <button
@@ -1039,7 +1236,10 @@ Answer concisely in English. Use USD formatting.`;
                         const depts = [...new Set(client.lines.map(line => line.department))].filter(Boolean);
                         return (
                           <tr key={client.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
-                            <td className="px-6 py-3 font-medium text-gray-800">{client.name}</td>
+                            <td className="px-6 py-3 font-medium text-gray-800">
+                              {client.name}
+                              {client.contract && <span className="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">contract</span>}
+                            </td>
                             <td className="px-6 py-3 text-xs text-gray-500">{client.lead || "—"}</td>
                             <td className="px-6 py-3">
                               <div className="flex flex-wrap gap-1">
@@ -1090,6 +1290,18 @@ Answer concisely in English. Use USD formatting.`;
                     ))}
                   </select>
                 )}
+                <button
+                  onClick={() => {
+                    setShowContract(true);
+                    setContractStep("upload");
+                    setContractError("");
+                    setContractResult(null);
+                    setContractFile(null);
+                  }}
+                  className="bg-blue-600 text-white text-sm px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors"
+                >
+                  Upload Contract
+                </button>
                 <button onClick={() => setShowAddClient(true)} className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors">
                   + Add Client
                 </button>
@@ -1097,12 +1309,12 @@ Answer concisely in English. Use USD formatting.`;
             </div>
 
             <div className="bg-blue-50 border border-blue-100 rounded-xl px-4 py-2 text-xs text-blue-600">
-              Click any amount in the Current or Next Month columns to edit it inline. Changes are saved automatically.
+              Click any amount in the Current or Next Month columns to edit it inline. Changes are saved automatically. You can also upload a contract PDF and the fixed fee will be loaded for every month in its term.
             </div>
 
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               {scopedClients.length === 0 ? (
-                <div className="px-6 py-10 text-center text-gray-300 text-sm">No clients — import your data</div>
+                <div className="px-6 py-10 text-center text-gray-300 text-sm">No clients — import your data or upload a contract</div>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
@@ -1111,6 +1323,7 @@ Answer concisely in English. Use USD formatting.`;
                       <th className="px-6 py-3 text-left">Lead</th>
                       <th className="px-6 py-3 text-left">Services</th>
                       <th className="px-6 py-3 text-left">Departments</th>
+                      <th className="px-6 py-3 text-left">Contract</th>
                       <th className="px-6 py-3 text-right">{currentMonthLabel || "Current"}</th>
                       <th className="px-6 py-3 text-right">{nextMonthLabel || "Next"}</th>
                       <th className="px-6 py-3 text-left">QBO Lines</th>
@@ -1134,6 +1347,18 @@ Answer concisely in English. Use USD formatting.`;
                                 </span>
                               ))}
                             </div>
+                          </td>
+                          <td className="px-6 py-3 text-xs">
+                            {client.contract ? (
+                              <span
+                                className="bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full cursor-help"
+                                title={`${client.contract.fileName} · ${fmt(client.contract.monthlyFee)}/mo${client.contract.startDate ? ` · ${client.contract.startDate}` : ""}${client.contract.endDate ? ` to ${client.contract.endDate}` : ""}${client.contract.notes ? ` · ${client.contract.notes}` : ""}`}
+                              >
+                                {fmt(client.contract.monthlyFee)}/mo
+                              </span>
+                            ) : (
+                              <span className="text-gray-300">—</span>
+                            )}
                           </td>
                           <td className="px-6 py-3 text-right">
                             <EditableCell value={client.amount} onSave={value => updateAmount(client.id, "amount", value)} />
@@ -1616,6 +1841,165 @@ Answer concisely in English. Use USD formatting.`;
         )}
       </div>
 
+      {showContract && (
+        <Modal title="Upload Contract" onClose={resetContractModal} wide>
+          {contractStep === "upload" && (
+            <div className="space-y-4">
+              <div className="bg-blue-50 rounded-xl p-3 text-xs text-blue-700 space-y-1">
+                <p className="font-medium">How it works:</p>
+                <p>1. Attach the client's contract as a PDF</p>
+                <p>2. The AI reads it and extracts the client, the monthly fixed fee and the contract term</p>
+                <p>3. You review the extracted data and confirm</p>
+                <p>4. Billing is loaded automatically for every month within the contract term</p>
+              </div>
+
+              {!monthCols.length && (
+                <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
+                  Import your sheet first so the dashboard knows which months exist. The contract fee is applied to the imported month columns.
+                </div>
+              )}
+
+              <label className="block border-2 border-dashed border-gray-200 rounded-2xl p-8 text-center cursor-pointer hover:border-blue-300 hover:bg-blue-50 transition-colors">
+                <input
+                  type="file"
+                  accept="application/pdf"
+                  className="hidden"
+                  onChange={e => {
+                    setContractFile(e.target.files?.[0] || null);
+                    setContractError("");
+                  }}
+                />
+                {contractFile ? (
+                  <div className="space-y-1">
+                    <p className="text-sm font-medium text-gray-800">{contractFile.name}</p>
+                    <p className="text-xs text-gray-400">{(contractFile.size / 1024).toFixed(0)} KB · click to change</p>
+                  </div>
+                ) : (
+                  <div className="space-y-1">
+                    <p className="text-sm font-medium text-gray-600">Click to attach the contract (PDF)</p>
+                    <p className="text-xs text-gray-400">The document is read locally and analyzed by AI</p>
+                  </div>
+                )}
+              </label>
+
+              {contractError && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{contractError}</p>}
+
+              <div className="flex gap-3">
+                <button onClick={resetContractModal} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
+                  Cancel
+                </button>
+                <button
+                  onClick={handleParseContract}
+                  disabled={!contractFile || contractParsing || !monthCols.length}
+                  className="flex-1 bg-blue-600 text-white rounded-lg py-2 text-sm hover:bg-blue-700 disabled:opacity-40"
+                >
+                  {contractParsing ? "Reading contract..." : "Read contract with AI"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {contractStep === "review" && contractResult && (
+            <div className="space-y-4">
+              <div className="bg-emerald-50 rounded-xl p-3 text-xs text-emerald-700">
+                Data extracted from <strong>{contractFile?.name}</strong>. Review and edit before confirming, then the fee will be loaded for every month within the term.
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                {[
+                  ["Client name *", "clientName", "text"],
+                  ["Service", "service", "text"],
+                  ["Department", "department", "text"],
+                  ["Currency", "currency", "text"],
+                ].map(([label, key, type]) => (
+                  <div key={key}>
+                    <label className="text-xs text-gray-500 mb-1 block">{label}</label>
+                    <input
+                      type={type}
+                      value={contractResult[key]}
+                      onChange={e => setContractResult(prev => ({ ...prev, [key]: e.target.value }))}
+                      className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
+                    />
+                  </div>
+                ))}
+                <div>
+                  <label className="text-xs text-gray-500 mb-1 block">Monthly fixed fee *</label>
+                  <input
+                    type="number"
+                    value={contractResult.monthlyFee}
+                    onChange={e => setContractResult(prev => ({ ...prev, monthlyFee: parseFloat(e.target.value) || 0 }))}
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 mb-1 block">Start (YYYY-MM)</label>
+                  <input
+                    type="text"
+                    value={contractResult.startDate}
+                    placeholder="2026-01"
+                    onChange={e => setContractResult(prev => ({ ...prev, startDate: e.target.value }))}
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs text-gray-500 mb-1 block">End (YYYY-MM, blank if open)</label>
+                  <input
+                    type="text"
+                    value={contractResult.endDate}
+                    placeholder=""
+                    onChange={e => setContractResult(prev => ({ ...prev, endDate: e.target.value }))}
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
+                  />
+                </div>
+              </div>
+
+              {contractResult.notes && (
+                <div className="bg-gray-50 rounded-xl p-3 text-xs text-gray-600">
+                  <span className="font-medium">Contract notes:</span> {contractResult.notes}
+                </div>
+              )}
+
+              <div className="bg-white border border-gray-100 rounded-xl overflow-hidden">
+                <div className="px-4 py-2 border-b border-gray-50 text-xs text-gray-400">Billing preview per month</div>
+                <div className="px-4 py-2 flex flex-wrap gap-2">
+                  {monthCols.map(col => {
+                    const amounts = buildContractAmounts(contractResult);
+                    const amt = amounts[col.h] || 0;
+                    return (
+                      <span key={col.h} className={`text-xs px-2 py-1 rounded-lg ${amt > 0 ? "bg-emerald-50 text-emerald-700" : "bg-gray-50 text-gray-300"}`}>
+                        {formatMonthLabel(col.d)}: {fmt(amt)}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {clients.some(c => makeClientKey(c.name) === makeClientKey(contractResult.clientName)) && (
+                <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
+                  This client already exists. The contract fee will be added as a new billing line on top of its current amounts.
+                </div>
+              )}
+
+              <div className="flex gap-3">
+                <button
+                  onClick={() => setContractStep("upload")}
+                  className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50"
+                >
+                  Back
+                </button>
+                <button
+                  onClick={applyContract}
+                  disabled={!contractResult.clientName.trim() || !contractResult.monthlyFee}
+                  className="flex-1 bg-blue-600 text-white rounded-lg py-2 text-sm hover:bg-blue-700 disabled:opacity-40"
+                >
+                  Confirm and add billing
+                </button>
+              </div>
+            </div>
+          )}
+        </Modal>
+      )}
+
       {showCloseConfirm && (
         <Modal title="Close Month" onClose={() => setShowCloseConfirm(false)}>
           <div className="space-y-4">
@@ -1661,7 +2045,7 @@ Answer concisely in English. Use USD formatting.`;
                   <p>2. Click on cell <strong>D1</strong> (Client Name header)</p>
                   <p>3. Select all data from D1 to the last column and row with data</p>
                   <p>4. Copy (Ctrl+C / Cmd+C) and paste below</p>
-                  <p className="text-blue-500">Manual clients and per-month approval history are preserved on re-import.</p>
+                  <p className="text-blue-500">Manual clients, contract lines and per-month approval history are preserved on re-import.</p>
                 </div>
                 <textarea
                   value={clientPaste}
@@ -1781,7 +2165,10 @@ Answer concisely in English. Use USD formatting.`;
               <tbody>
                 {showInvoiceDetail.lines?.filter(line => (line.amount ?? line.amounts?.[showInvoiceDetail.monthCol] ?? 0) > 0).map((line, idx) => (
                   <tr key={idx} className="border-b border-gray-50">
-                    <td className="py-2 text-gray-700">{line.service}</td>
+                    <td className="py-2 text-gray-700">
+                      {line.service}
+                      {line.fromContract && <span className="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">contract</span>}
+                    </td>
                     <td className="py-2">
                       <span className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{line.department}</span>
                     </td>
