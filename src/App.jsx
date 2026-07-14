@@ -1,3 +1,4 @@
+
 import { useEffect, useMemo, useRef, useState } from "react";
 
 const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
@@ -415,6 +416,43 @@ function buildClosedMonthRecord(monthKey, ctx, invoices) {
   };
 }
 
+// ---------- QuickBooks via MCP ----------
+
+const QBO_MCP = { type: "url", url: "https://ai-inc.quickbooks.intuit.com/v1/mcp", name: "quickbooks-mcp" };
+
+async function qboCall(instruction, systemNote) {
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system:
+          systemNote ||
+          "You are an invoicing agent for a service agency. Use the QuickBooks tools to complete the task. When done, reply with a single short JSON object: {\"ok\": true|false, \"summary\": string, \"invoiceId\": string}. No markdown fences, no extra text.",
+        messages: [{ role: "user", content: instruction }],
+        mcp_servers: [QBO_MCP],
+      }),
+    });
+  } catch {
+    throw new Error("Network error reaching the AI API. If running outside claude.ai this call is blocked by CORS.");
+  }
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`QBO call failed (${res.status}). ${errText.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("\n") || "";
+  const clean = text.replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch {
+    return { ok: true, summary: clean.slice(0, 300), invoiceId: "" };
+  }
+}
+
 // ---------- Contract parsing helpers ----------
 
 function fileToBase64(file) {
@@ -439,7 +477,12 @@ function yearMonthFromString(s) {
   return Number(m[1]) * 12 + (Number(m[2]) - 1);
 }
 
+const MAX_CONTRACT_MB = 8;
+
 async function parseContractWithAI(file) {
+  if (file.size > MAX_CONTRACT_MB * 1024 * 1024) {
+    throw new Error(`The file is ${(file.size / 1024 / 1024).toFixed(1)} MB. Please use a PDF under ${MAX_CONTRACT_MB} MB, ideally the contract pages with the fee and term only.`);
+  }
   const base64Data = await fileToBase64(file);
   const system = `You are a contract data extractor for a service agency's invoicing system.
 Read the attached contract and extract the billing details.
@@ -456,29 +499,44 @@ Respond ONLY with a valid JSON object, no markdown fences, no preamble, with exa
 }
 If the fee is stated annually, divide by 12. If multiple fees exist, use the recurring monthly fixed fee.`;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      system,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } },
-            { type: "text", text: "Extract the billing details from this contract as JSON." },
-          ],
-        },
-      ],
-    }),
-  });
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } },
+              { type: "text", text: "Extract the billing details from this contract as JSON." },
+            ],
+          },
+        ],
+      }),
+    });
+  } catch {
+    throw new Error("Network error calling the AI API (Failed to fetch). If you are running this app outside claude.ai, direct browser calls to api.anthropic.com are blocked by CORS and need a backend proxy. If you are inside claude.ai, try a smaller PDF or check your connection.");
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`The AI API returned ${res.status}. ${errText.slice(0, 200)}`);
+  }
 
   const data = await res.json();
   const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("\n") || "";
   const clean = text.replace(/```json|```/g, "").trim();
-  const parsed = JSON.parse(clean);
+  let parsed;
+  try {
+    parsed = JSON.parse(clean);
+  } catch {
+    throw new Error("The AI response could not be read as structured data. Try again or use a clearer PDF.");
+  }
 
   return {
     clientName: String(parsed.clientName || "").trim(),
@@ -521,6 +579,9 @@ export default function App() {
   const [approveComment, setApproveComment] = useState("");
   const [qboConnected, setQboConnected] = useState(false);
   const [qboSyncing, setQboSyncing] = useState(false);
+  const [qboCompany, setQboCompany] = useState("");
+  const [qboError, setQboError] = useState("");
+  const [qboSendingId, setQboSendingId] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
 
@@ -986,12 +1047,57 @@ export default function App() {
   const notApprovedCount = approvalBase.filter(inv => !["approved", "sent"].includes(inv.status)).length;
   const canCloseApprovalMonth = approvalBase.length > 0 && notApprovedCount === 0;
 
+  async function connectQBO() {
+    setQboSyncing(true);
+    setQboError("");
+    try {
+      const result = await qboCall(
+        "Get the QuickBooks company information and confirm the connection.",
+        'You verify a QuickBooks connection. Use the company info tool. Reply only with JSON: {"ok": true|false, "summary": "<company name>"}. No markdown, no extra text.'
+      );
+      if (result.ok === false) throw new Error(result.summary || "QuickBooks did not respond.");
+      setQboConnected(true);
+      setQboCompany(result.summary || "");
+    } catch (e) {
+      setQboError(e.message);
+      setQboConnected(false);
+    }
+    setQboSyncing(false);
+  }
+
   async function sendInvoiceToQBO(inv) {
-    await saveApprovalEntry(inv.approvalMonthKey, inv.clientName, {
-      status: "sent",
-      comment: inv.comment || "",
-      approver: inv.approver || "",
-    });
+    if (qboSendingId) return;
+    setQboSendingId(inv.id);
+    setQboError("");
+    const activeLines = (inv.lines || []).filter(line => (line.amounts?.[inv.monthCol] || 0) > 0);
+    const lineSpec = activeLines.length
+      ? activeLines.map(line => ({
+          description: [line.service, line.department].filter(Boolean).join(" — ") || "Monthly fixed fee",
+          amount: line.amounts[inv.monthCol],
+        }))
+      : [{ description: "Monthly fixed fee", amount: inv.amount }];
+
+    const instruction = `Create an invoice in QuickBooks Online for the customer "${inv.clientName}" for the billing period ${inv.month}.
+Steps:
+1. Search for the customer by name. If it does not exist, create it with that name.
+2. Search the product/service catalog for a suitable generic service item (e.g. "Services" or "Hours"). If none exists, create one named "Monthly Services".
+3. Create the invoice with these lines (one line per entry, description and amount in USD):
+${JSON.stringify(lineSpec)}
+Total must be ${inv.amount}.
+Do NOT email the invoice to the customer, only create it as a draft in QuickBooks.`;
+
+    try {
+      const result = await qboCall(instruction);
+      if (result.ok === false) throw new Error(result.summary || "QuickBooks rejected the invoice.");
+      await saveApprovalEntry(inv.approvalMonthKey, inv.clientName, {
+        status: "sent",
+        comment: result.invoiceId ? `QBO invoice ${result.invoiceId}` : result.summary || inv.comment || "",
+        approver: inv.approver || "",
+      });
+    } catch (e) {
+      setQboError(`${inv.clientName}: ${e.message}`);
+    }
+    setQboSendingId("");
   }
 
   async function resubmitInvoice(inv) {
@@ -1127,23 +1233,15 @@ Answer concisely in English. Use USD formatting.`;
             {connected ? `Synced: ${clients.length} clients — Re-import` : "Import from Sheet"}
           </button>
 
+          {qboError && <span className="text-xs font-medium text-red-500 max-w-xs truncate" title={qboError}>{qboError}</span>}
           <button
-            onClick={
-              qboConnected
-                ? undefined
-                : () => {
-                    setQboSyncing(true);
-                    setTimeout(() => {
-                      setQboConnected(true);
-                      setQboSyncing(false);
-                    }, 1800);
-                  }
-            }
+            onClick={qboConnected || qboSyncing ? undefined : connectQBO}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
               qboConnected ? "bg-emerald-50 text-emerald-700 cursor-default border border-emerald-200" : "bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"
             }`}
+            title={qboCompany ? `Connected to ${qboCompany}` : "Verifies the connection through your QuickBooks connector in claude.ai"}
           >
-            {qboSyncing ? "Connecting..." : qboConnected ? "QBO Connected" : "Connect QuickBooks"}
+            {qboSyncing ? "Connecting..." : qboConnected ? `QBO Connected${qboCompany ? ` — ${qboCompany}` : ""}` : "Connect QuickBooks"}
           </button>
         </div>
       </div>
@@ -1465,8 +1563,12 @@ Answer concisely in English. Use USD formatting.`;
                                 </button>
                               )}
                               {inv.status === "approved" && qboConnected && (
-                                <button onClick={() => sendInvoiceToQBO(inv)} className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700">
-                                  Send via QBO
+                                <button
+                                  onClick={() => sendInvoiceToQBO(inv)}
+                                  disabled={!!qboSendingId}
+                                  className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 disabled:opacity-40"
+                                >
+                                  {qboSendingId === inv.id ? "Sending..." : "Send via QBO"}
                                 </button>
                               )}
                               {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
@@ -1685,8 +1787,12 @@ Answer concisely in English. Use USD formatting.`;
                                   </button>
                                 )}
                                 {inv.status === "approved" && qboConnected && (
-                                  <button onClick={() => sendInvoiceToQBO(inv)} className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700">
-                                    Send via QBO
+                                  <button
+                                    onClick={() => sendInvoiceToQBO(inv)}
+                                    disabled={!!qboSendingId}
+                                    className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 disabled:opacity-40"
+                                  >
+                                    {qboSendingId === inv.id ? "Sending..." : "Send via QBO"}
                                   </button>
                                 )}
                                 {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
