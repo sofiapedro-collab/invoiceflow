@@ -1,10 +1,7 @@
-
 import { useEffect, useMemo, useRef, useState } from "react";
-
 const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhweWNxZWdvZ2txc29kdnlrcWZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5NTUxMTcsImV4cCI6MjA4OTUzMTExN30.Rb5r_9gsNNVIl0e9dqYraYJdDayvunqEMfQ_I8FmfKI";
 const LOCAL_STORAGE_KEY = "invoiceflow_data_backup";
-
 async function loadFromSupabase() {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.main&select=data`, {
     headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
@@ -13,7 +10,6 @@ async function loadFromSupabase() {
   const rows = await res.json();
   return rows?.[0]?.data || null;
 }
-
 async function saveToSupabase(data) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?on_conflict=id`, {
     method: "POST",
@@ -27,7 +23,6 @@ async function saveToSupabase(data) {
   });
   if (!res.ok) throw new Error(`Supabase save failed: ${res.status} ${await res.text()}`);
 }
-
 function loadLocalBackup() {
   try {
     return JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || "null");
@@ -35,25 +30,26 @@ function loadLocalBackup() {
     return null;
   }
 }
-
 function saveLocalBackup(data) {
   localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
 }
-
 function fmt(n) {
   return "$" + Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2 });
 }
-
 const DEPT_DEFAULT_LEADS = { "fiat finance": "Kaley", uncovered: "Nick" };
-
 function getDefaultLead(d) {
   return DEPT_DEFAULT_LEADS[d?.toLowerCase().trim()] || "";
 }
-
 function makeClientKey(name) {
   return String(name || "").trim().toLowerCase();
 }
-
+function sortClientsBy(list, mode, getName = item => item.name) {
+  if (mode === "sheet" || !mode) return list;
+  const sorted = [...(list || [])].sort((a, b) =>
+    String(getName(a) || "").localeCompare(String(getName(b) || ""), "en", { sensitivity: "base" })
+  );
+  return mode === "za" ? sorted.reverse() : sorted;
+}
 function Badge({ status }) {
   const s = {
     active: "bg-emerald-50 text-emerald-700",
@@ -70,7 +66,6 @@ function Badge({ status }) {
     </span>
   );
 }
-
 function Modal({ title, onClose, children, wide }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-20 p-4">
@@ -86,24 +81,20 @@ function Modal({ title, onClose, children, wide }) {
     </div>
   );
 }
-
 function EditableCell({ value, onSave }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState("");
   const ref = useRef(null);
-
   function start() {
     setVal(String(value || 0));
     setEditing(true);
     setTimeout(() => ref.current?.select(), 30);
   }
-
   function save() {
     const n = parseFloat(String(val).replace(/[$,]/g, "")) || 0;
     onSave(n);
     setEditing(false);
   }
-
   if (editing) {
     return (
       <input
@@ -119,7 +110,6 @@ function EditableCell({ value, onSave }) {
       />
     );
   }
-
   return (
     <span
       onClick={start}
@@ -130,11 +120,9 @@ function EditableCell({ value, onSave }) {
     </span>
   );
 }
-
 function NewProjectedClients({ clients, currentMonthLabel, lastMonthLabel }) {
   const newProjected = clients.filter(c => c.amount > 0 && c.lastAmount === 0);
   if (!newProjected.length) return null;
-
   return (
     <div className="bg-white rounded-2xl border border-emerald-100 overflow-hidden">
       <div className="px-6 py-4 border-b border-emerald-50 flex items-center justify-between">
@@ -179,7 +167,6 @@ function NewProjectedClients({ clients, currentMonthLabel, lastMonthLabel }) {
     </div>
   );
 }
-
 function parseColDate(header) {
   const h = String(header);
   let m = h.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
@@ -192,25 +179,21 @@ function parseColDate(header) {
   }
   return null;
 }
-
 function formatMonthLabel(d) {
   if (!d || !(d instanceof Date) || Number.isNaN(d.getTime())) return "";
   return d.toLocaleString("en-US", { month: "short", year: "numeric" });
 }
-
 function labelFromKey(key) {
   if (!key) return "";
   const d = parseColDate(key);
   return d ? formatMonthLabel(d) : key;
 }
-
 function parsePaste(text) {
   return text
     .trim()
     .split("\n")
     .map(r => r.split("\t").map(c => c.trim()));
 }
-
 function rowsToObjects(rows) {
   if (rows.length < 2) return { objects: [], headers: [] };
   const headers = rows[0];
@@ -220,26 +203,21 @@ function rowsToObjects(rows) {
     .map(row => Object.fromEntries(headers.map((h, i) => [h, row[i] ?? ""])));
   return { objects, headers };
 }
-
 function parseAmount(val) {
   if (!val) return 0;
   return parseFloat(String(val).replace(/[$,\s]/g, "")) || 0;
 }
-
 function getMonthCols(headers) {
   return headers
     .map((h, i) => ({ h, i, d: parseColDate(h) }))
     .filter(x => x.d)
     .sort((a, b) => a.d - b.d);
 }
-
 function normalizeMonthCols(savedCols, savedClients = []) {
   const fromSaved = (savedCols || [])
     .map((col, idx) => ({ h: col.h, i: col.i ?? idx, d: parseColDate(col.h) }))
     .filter(col => col.h && col.d);
-
   if (fromSaved.length) return fromSaved.sort((a, b) => a.d - b.d);
-
   const keys = new Set();
   (savedClients || []).forEach(client => {
     (client.lines || []).forEach(line => {
@@ -248,13 +226,11 @@ function normalizeMonthCols(savedCols, savedClients = []) {
       });
     });
   });
-
   return [...keys]
     .map((h, i) => ({ h, i, d: parseColDate(h) }))
     .filter(col => col.d)
     .sort((a, b) => a.d - b.d);
 }
-
 function getMonthContext(cols, key) {
   if (!cols.length) {
     return {
@@ -266,13 +242,11 @@ function getMonthContext(cols, key) {
       prevLabel: "",
     };
   }
-
   const fallback = cols[cols.length - 2] || cols[cols.length - 1];
   const current = (key && cols.find(c => c.h === key)) || fallback;
   const idx = cols.findIndex(c => c.h === current.h);
   const prev = idx > 0 ? cols[idx - 1] : null;
   const next = idx < cols.length - 1 ? cols[idx + 1] : null;
-
   return {
     curKey: current?.h || "",
     nextKey: next?.h || "",
@@ -282,12 +256,10 @@ function getMonthContext(cols, key) {
     prevLabel: prev ? formatMonthLabel(prev.d) : "",
   };
 }
-
 function sumForMonth(lines, monthKey) {
   if (!monthKey) return 0;
   return (lines || []).reduce((sum, line) => sum + (line.amounts?.[monthKey] || 0), 0);
 }
-
 function enrichClientForContext(client, ctx) {
   const lines = client.lines || [];
   return {
@@ -298,23 +270,18 @@ function enrichClientForContext(client, ctx) {
     multiDept: new Set(lines.map(l => l.department).filter(Boolean)).size > 1,
   };
 }
-
 function cloneLinesWithAdjustedTotal(lines, monthKey, newTotal) {
   const nextLines = (lines || []).map(line => ({
     ...line,
     amounts: { ...(line.amounts || {}) },
   }));
-
   if (!monthKey || !nextLines.length) return nextLines;
-
   const currentTotal = nextLines.reduce((sum, line) => sum + (line.amounts?.[monthKey] || 0), 0);
   const delta = newTotal - currentTotal;
-
   if (nextLines.length === 1) {
     nextLines[0].amounts[monthKey] = newTotal;
     return nextLines;
   }
-
   let targetIdx = 0;
   let biggest = -Infinity;
   nextLines.forEach((line, idx) => {
@@ -324,16 +291,13 @@ function cloneLinesWithAdjustedTotal(lines, monthKey, newTotal) {
       targetIdx = idx;
     }
   });
-
   nextLines[targetIdx].amounts[monthKey] = (nextLines[targetIdx].amounts?.[monthKey] || 0) + delta;
   return nextLines;
 }
-
 function buildInvoiceRecord(client, ctx, approvalHistory, defaultApprover) {
   const approvalMonthKey = ctx.curKey;
   const stored = approvalHistory?.[approvalMonthKey]?.[makeClientKey(client.name)] || {};
   const lines = client.lines || [];
-
   return {
     id: `${approvalMonthKey}-${client.id}`,
     clientId: client.id,
@@ -354,7 +318,6 @@ function buildInvoiceRecord(client, ctx, approvalHistory, defaultApprover) {
     multiDept: new Set(lines.map(l => l.department).filter(Boolean)).size > 1,
   };
 }
-
 function migrateApprovalHistory(legacyInvoices) {
   const history = {};
   (legacyInvoices || []).forEach(inv => {
@@ -370,11 +333,9 @@ function migrateApprovalHistory(legacyInvoices) {
   });
   return history;
 }
-
 function normalizeClosedMonths(value) {
   return (value || []).map(item => (typeof item === "string" ? { monthKey: item, monthLabel: labelFromKey(item), closedAt: "", invoices: [] } : item));
 }
-
 function buildClosedMonthRecord(monthKey, ctx, invoices) {
   const snapshotInvoices = (invoices || [])
     .filter(inv => inv.amount > 0)
@@ -401,7 +362,6 @@ function buildClosedMonthRecord(monthKey, ctx, invoices) {
           amount: line.amounts?.[inv.monthCol] || 0,
         })),
     }));
-
   return {
     monthKey,
     monthLabel: ctx.curLabel,
@@ -415,11 +375,8 @@ function buildClosedMonthRecord(monthKey, ctx, invoices) {
     invoices: snapshotInvoices,
   };
 }
-
 // ---------- QuickBooks via MCP ----------
-
 const QBO_MCP = { type: "url", url: "https://ai-inc.quickbooks.intuit.com/v1/mcp", name: "quickbooks-mcp" };
-
 async function qboCall(instruction, systemNote) {
   let res;
   try {
@@ -452,9 +409,7 @@ async function qboCall(instruction, systemNote) {
     return { ok: true, summary: clean.slice(0, 300), invoiceId: "" };
   }
 }
-
 // ---------- Contract parsing helpers ----------
-
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -463,22 +418,18 @@ function fileToBase64(file) {
     reader.readAsDataURL(file);
   });
 }
-
 function monthKeyToYearMonth(key) {
   const d = parseColDate(key);
   if (!d) return null;
   return d.getFullYear() * 12 + d.getMonth();
 }
-
 function yearMonthFromString(s) {
   // Accepts "YYYY-MM" or "YYYY-MM-DD"
   const m = String(s || "").match(/^(\d{4})-(\d{2})/);
   if (!m) return null;
   return Number(m[1]) * 12 + (Number(m[2]) - 1);
 }
-
 const MAX_CONTRACT_MB = 8;
-
 async function parseContractWithAI(file) {
   if (file.size > MAX_CONTRACT_MB * 1024 * 1024) {
     throw new Error(`The file is ${(file.size / 1024 / 1024).toFixed(1)} MB. Please use a PDF under ${MAX_CONTRACT_MB} MB, ideally the contract pages with the fee and term only.`);
@@ -498,7 +449,6 @@ Respond ONLY with a valid JSON object, no markdown fences, no preamble, with exa
   "notes": string                  // anything relevant for billing: setup fees, escalations, payment terms
 }
 If the fee is stated annually, divide by 12. If multiple fees exist, use the recurring monthly fixed fee.`;
-
   let res;
   try {
     res = await fetch("https://api.anthropic.com/v1/messages", {
@@ -522,12 +472,10 @@ If the fee is stated annually, divide by 12. If multiple fees exist, use the rec
   } catch {
     throw new Error("Network error calling the AI API (Failed to fetch). If you are running this app outside claude.ai, direct browser calls to api.anthropic.com are blocked by CORS and need a backend proxy. If you are inside claude.ai, try a smaller PDF or check your connection.");
   }
-
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
     throw new Error(`The AI API returned ${res.status}. ${errText.slice(0, 200)}`);
   }
-
   const data = await res.json();
   const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("\n") || "";
   const clean = text.replace(/```json|```/g, "").trim();
@@ -537,7 +485,6 @@ If the fee is stated annually, divide by 12. If multiple fees exist, use the rec
   } catch {
     throw new Error("The AI response could not be read as structured data. Try again or use a clearer PDF.");
   }
-
   return {
     clientName: String(parsed.clientName || "").trim(),
     service: String(parsed.service || "").trim(),
@@ -549,7 +496,6 @@ If the fee is stated annually, divide by 12. If multiple fees exist, use the rec
     notes: String(parsed.notes || "").trim(),
   };
 }
-
 export default function App() {
   const [storageLoading, setStorageLoading] = useState(true);
   const [tab, setTab] = useState("dashboard");
@@ -560,7 +506,6 @@ export default function App() {
   const [importError, setImportError] = useState("");
   const [showAddClient, setShowAddClient] = useState(false);
   const [newClient, setNewClient] = useState({ name: "", service: "", department: "", lead: "", currentAmt: "", nextAmt: "" });
-
   const [rawRows, setRawRows] = useState([]);
   const [clients, setClients] = useState([]);
   const [approvers, setApprovers] = useState([]);
@@ -569,11 +514,9 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [curColKey, setCurColKey] = useState("");
   const [approvalMonthKey, setApprovalMonthKey] = useState("");
-
   const [closedMonths, setClosedMonths] = useState([]);
   const [selectedClosedMonthKey, setSelectedClosedMonthKey] = useState("");
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
-
   const [showApprove, setShowApprove] = useState(null);
   const [showInvoiceDetail, setShowInvoiceDetail] = useState(null);
   const [approveComment, setApproveComment] = useState("");
@@ -584,7 +527,8 @@ export default function App() {
   const [qboSendingId, setQboSendingId] = useState("");
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
-
+  // Client sorting: "sheet" | "az" | "za"
+  const [clientSort, setClientSort] = useState("sheet");
   // Contract upload state
   const [showContract, setShowContract] = useState(false);
   const [contractStep, setContractStep] = useState("upload"); // upload | review
@@ -592,35 +536,38 @@ export default function App() {
   const [contractParsing, setContractParsing] = useState(false);
   const [contractError, setContractError] = useState("");
   const [contractResult, setContractResult] = useState(null);
-
   const [aiMessages, setAiMessages] = useState([
     { role: "assistant", content: "Hi! Import your data from Google Sheets and then ask me anything about your clients, invoices, or monthly performance." },
   ]);
   const [aiInput, setAiInput] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const chatEndRef = useRef(null);
-
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [aiMessages]);
-
   const billingContext = useMemo(() => getMonthContext(monthCols, curColKey), [monthCols, curColKey]);
   const approvalMonthOptions = useMemo(() => monthCols, [monthCols]);
   const effectiveApprovalMonthKey = approvalMonthKey || billingContext.curKey || approvalMonthOptions[approvalMonthOptions.length - 1]?.h || "";
   const approvalContext = useMemo(() => getMonthContext(monthCols, effectiveApprovalMonthKey), [monthCols, effectiveApprovalMonthKey]);
-
   const currentMonthLabel = billingContext.curLabel;
   const lastMonthLabel = billingContext.prevLabel;
   const nextMonthLabel = billingContext.nextLabel;
-
-  const scopedClients = useMemo(() => clients.map(client => enrichClientForContext(client, billingContext)), [clients, billingContext]);
+  const scopedClients = useMemo(
+    () => sortClientsBy(clients.map(client => enrichClientForContext(client, billingContext)), clientSort),
+    [clients, billingContext, clientSort]
+  );
   const billingInvoices = useMemo(
     () => scopedClients.map(client => buildInvoiceRecord(client, billingContext, approvalHistory, approvers[0] || "")),
     [scopedClients, billingContext, approvalHistory, approvers]
   );
   const approvalInvoices = useMemo(
-    () => clients.map(client => buildInvoiceRecord(enrichClientForContext(client, approvalContext), approvalContext, approvalHistory, approvers[0] || "")),
-    [clients, approvalContext, approvalHistory, approvers]
+    () =>
+      sortClientsBy(
+        clients.map(client => buildInvoiceRecord(enrichClientForContext(client, approvalContext), approvalContext, approvalHistory, approvers[0] || "")),
+        clientSort,
+        inv => inv.clientName
+      ),
+    [clients, approvalContext, approvalHistory, approvers, clientSort]
   );
   const closedMonthRecords = useMemo(() => normalizeClosedMonths(closedMonths), [closedMonths]);
   const closedMonthKeys = useMemo(() => closedMonthRecords.map(month => month.monthKey), [closedMonthRecords]);
@@ -628,7 +575,6 @@ export default function App() {
     () => closedMonthRecords.find(month => month.monthKey === selectedClosedMonthKey) || closedMonthRecords[closedMonthRecords.length - 1] || null,
     [closedMonthRecords, selectedClosedMonthKey]
   );
-
   function buildSnapshot(overrides = {}) {
     return {
       rawRows: overrides.rawRows ?? rawRows,
@@ -640,9 +586,9 @@ export default function App() {
       approvalMonthKey: overrides.approvalMonthKey ?? effectiveApprovalMonthKey,
       closedMonths: overrides.closedMonths ?? closedMonthRecords,
       connected: overrides.connected ?? connected,
+      clientSort: overrides.clientSort ?? clientSort,
     };
   }
-
   async function persistSnapshot(overrides = {}) {
     setSaving(true);
     setSaveError("");
@@ -656,7 +602,6 @@ export default function App() {
     }
     setSaving(false);
   }
-
   useEffect(() => {
     async function load() {
       try {
@@ -666,7 +611,6 @@ export default function App() {
           const loadedMonthCols = normalizeMonthCols(d.monthCols || [], loadedClients);
           const initialContext = getMonthContext(loadedMonthCols, d.curColKey || "");
           const initialApprovalKey = d.approvalMonthKey || initialContext.curKey || "";
-
           setRawRows(d.rawRows || []);
           setClients(loadedClients);
           setApprovers(d.approvers || []);
@@ -677,6 +621,7 @@ export default function App() {
           setMonthCols(loadedMonthCols);
           setCurColKey(initialContext.curKey);
           setApprovalMonthKey(initialApprovalKey);
+          setClientSort(d.clientSort || "sheet");
           setConnected(true);
           setAiMessages([{ role: "assistant", content: `Data loaded: ${loadedClients.length} clients. Ask me anything!` }]);
         }
@@ -688,7 +633,6 @@ export default function App() {
           const loadedMonthCols = normalizeMonthCols(d.monthCols || [], loadedClients);
           const initialContext = getMonthContext(loadedMonthCols, d.curColKey || "");
           const initialApprovalKey = d.approvalMonthKey || initialContext.curKey || "";
-
           setRawRows(d.rawRows || []);
           setClients(loadedClients);
           setApprovers(d.approvers || []);
@@ -699,6 +643,7 @@ export default function App() {
           setMonthCols(loadedMonthCols);
           setCurColKey(initialContext.curKey);
           setApprovalMonthKey(initialApprovalKey);
+          setClientSort(d.clientSort || "sheet");
           setConnected(true);
           setSaveError("Loaded local backup. Supabase load failed.");
           setAiMessages([{ role: "assistant", content: `Local backup loaded: ${loadedClients.length} clients. Supabase needs attention.` }]);
@@ -708,14 +653,11 @@ export default function App() {
       }
       setStorageLoading(false);
     }
-
     load();
   }, []);
-
   async function updateAmount(clientId, field, newVal) {
     const monthKey = field === "amount" ? billingContext.curKey : billingContext.nextKey;
     if (!monthKey) return;
-
     const updatedClients = clients.map(client => {
       if (client.id !== clientId) return client;
       return {
@@ -723,20 +665,16 @@ export default function App() {
         lines: cloneLinesWithAdjustedTotal(client.lines, monthKey, newVal),
       };
     });
-
     setClients(updatedClients);
     await persistSnapshot({ clients: updatedClients });
   }
-
   async function archiveClient(clientId) {
     const updatedClients = clients.map(client => (client.id === clientId ? { ...client, status: "archived" } : client));
     setClients(updatedClients);
     await persistSnapshot({ clients: updatedClients });
   }
-
   async function addClientManually() {
     if (!newClient.name.trim()) return;
-
     const id = `manual-${Date.now()}`;
     const curAmt = parseFloat(newClient.currentAmt) || 0;
     const nextAmt = parseFloat(newClient.nextAmt) || 0;
@@ -749,7 +687,6 @@ export default function App() {
       lead,
       amounts: { [billingContext.curKey]: curAmt, [billingContext.nextKey]: nextAmt },
     };
-
     const updatedClients = [
       ...clients,
       {
@@ -761,15 +698,12 @@ export default function App() {
         lines: [line],
       },
     ];
-
     setClients(updatedClients);
     setShowAddClient(false);
     setNewClient({ name: "", service: "", department: "", lead: "", currentAmt: "", nextAmt: "" });
     await persistSnapshot({ clients: updatedClients, connected: true });
   }
-
   // ---------- Contract flow ----------
-
   function resetContractModal() {
     setShowContract(false);
     setContractStep("upload");
@@ -778,7 +712,6 @@ export default function App() {
     setContractError("");
     setContractResult(null);
   }
-
   async function handleParseContract() {
     if (!contractFile) return;
     setContractParsing(true);
@@ -794,7 +727,6 @@ export default function App() {
     }
     setContractParsing(false);
   }
-
   function buildContractAmounts(result) {
     const startYM = yearMonthFromString(result.startDate);
     const endYM = yearMonthFromString(result.endDate);
@@ -808,10 +740,8 @@ export default function App() {
     });
     return amounts;
   }
-
   async function applyContract() {
     if (!contractResult || !monthCols.length) return;
-
     const result = contractResult;
     const amounts = buildContractAmounts(result);
     const key = makeClientKey(result.clientName);
@@ -826,7 +756,6 @@ export default function App() {
       notes: result.notes,
       parsedAt: new Date().toISOString(),
     };
-
     const newLine = {
       _id: `contract-${Date.now()}`,
       clientName: result.clientName,
@@ -836,7 +765,6 @@ export default function App() {
       fromContract: true,
       amounts,
     };
-
     let updatedClients;
     if (existing) {
       updatedClients = clients.map(c =>
@@ -856,7 +784,6 @@ export default function App() {
         },
       ];
     }
-
     setClients(updatedClients);
     resetContractModal();
     setAiMessages(prev => [
@@ -865,24 +792,19 @@ export default function App() {
     ]);
     await persistSnapshot({ clients: updatedClients, connected: true });
   }
-
   async function processImport() {
     setImportError("");
-
     try {
       const clientRows = parsePaste(clientPaste);
       const { objects, headers } = rowsToObjects(clientRows);
       if (!objects.length) throw new Error("No data found. Make sure to include the header row.");
-
       const cols = getMonthCols(headers);
       if (!cols.length) throw new Error("No month columns found. Expected format: 01/01/2025 or Jan 2025.");
-
       const importContext = getMonthContext(cols, curColKey);
       const nameKey = headers.find(h => /client.*name|^client$/i.test(h));
       const serviceKey = headers.find(h => /^service$/i.test(h));
       const deptKey = headers.find(h => /department|dept/i.test(h));
       if (!nameKey) throw new Error("Could not find a 'Client Name' column.");
-
       let leadMap = {};
       let approverNames = [];
       if (leadPaste.trim()) {
@@ -897,7 +819,6 @@ export default function App() {
         });
         approverNames = [...new Set(leadObjects.map(row => row[leadCol]).filter(Boolean))];
       }
-
       const resolveLead = (name, dept, existingLead) => leadMap[makeClientKey(name)] || existingLead || getDefaultLead(dept) || "";
       const enriched = objects
         .filter(row => row[nameKey]?.trim())
@@ -913,16 +834,13 @@ export default function App() {
             amounts: Object.fromEntries(cols.map(c => [c.h, parseAmount(row[c.h])])),
           };
         });
-
       const grouped = {};
       enriched.forEach(row => {
         if (!grouped[row.clientName]) grouped[row.clientName] = { name: row.clientName, lines: [] };
         grouped[row.clientName].lines.push(row);
       });
-
       const existingByKey = Object.fromEntries(clients.map(client => [makeClientKey(client.name), client]));
       const importedKeys = new Set(Object.keys(grouped).map(makeClientKey));
-
       const importedClients = Object.values(grouped).map((group, idx) => {
         const existing = existingByKey[makeClientKey(group.name)];
         const lead = resolveLead(group.name, group.lines[0]?.department || "", existing?.lead);
@@ -937,12 +855,10 @@ export default function App() {
           lines: [...group.lines.map(line => ({ ...line, lead: line.lead || lead })), ...contractLines],
         };
       });
-
       const manualOnlyClients = clients.filter(client => client.manual && !importedKeys.has(makeClientKey(client.name)));
       const updatedClients = [...importedClients, ...manualOnlyClients];
       const updatedApprovers = approverNames.length ? approverNames : approvers;
       const updatedApprovalMonthKey = cols.find(c => c.h === effectiveApprovalMonthKey) ? effectiveApprovalMonthKey : importContext.curKey;
-
       setRawRows(enriched);
       setClients(updatedClients);
       setApprovers(updatedApprovers);
@@ -955,7 +871,6 @@ export default function App() {
       setLeadPaste("");
       setImportStep("clients");
       setAiMessages([{ role: "assistant", content: `Synced ${updatedClients.length} clients with ${enriched.length} service lines. Ask me anything!` }]);
-
       await persistSnapshot({
         rawRows: enriched,
         clients: updatedClients,
@@ -969,7 +884,6 @@ export default function App() {
       setImportError(e.message);
     }
   }
-
   async function saveApprovalEntry(monthKey, clientName, patch) {
     const clientKey = makeClientKey(clientName);
     const updatedApprovalHistory = {
@@ -982,11 +896,9 @@ export default function App() {
         },
       },
     };
-
     setApprovalHistory(updatedApprovalHistory);
     await persistSnapshot({ approvalHistory: updatedApprovalHistory });
   }
-
   async function approveInvoice(decision) {
     if (!showApprove) return;
     await saveApprovalEntry(showApprove.approvalMonthKey, showApprove.clientName, {
@@ -997,7 +909,6 @@ export default function App() {
     setApproveComment("");
     setShowApprove(null);
   }
-
   async function resetApprovalsForMonth() {
     if (!effectiveApprovalMonthKey) return;
     const updatedApprovalHistory = { ...approvalHistory };
@@ -1005,17 +916,14 @@ export default function App() {
     setApprovalHistory(updatedApprovalHistory);
     await persistSnapshot({ approvalHistory: updatedApprovalHistory });
   }
-
   async function closeMonth() {
     if (!effectiveApprovalMonthKey) return;
     if (!canCloseApprovalMonth) return;
-
     const monthRecord = buildClosedMonthRecord(effectiveApprovalMonthKey, approvalContext, approvalBase);
     const updatedClosed = [...closedMonthRecords.filter(month => month.monthKey !== effectiveApprovalMonthKey), monthRecord];
     setClosedMonths(updatedClosed);
     setSelectedClosedMonthKey(effectiveApprovalMonthKey);
     setShowCloseConfirm(false);
-
     const nextKey = approvalContext.nextKey;
     if (nextKey) {
       setApprovalMonthKey(nextKey);
@@ -1025,28 +933,23 @@ export default function App() {
       await persistSnapshot({ closedMonths: updatedClosed });
     }
   }
-
   const activeClients = scopedClients.filter(client => client.status === "active");
   const totalProjected = activeClients.reduce((sum, client) => sum + client.amount, 0);
   const totalLast = activeClients.reduce((sum, client) => sum + client.lastAmount, 0);
   const totalNext = activeClients.reduce((sum, client) => sum + client.nextAmount, 0);
-
   const [filterLead, setFilterLead] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
-
   const approvalBase = approvalInvoices.filter(inv => inv.amount > 0);
   const approvalLeads = ["all", ...new Set(approvalBase.map(inv => inv.lead).filter(Boolean))];
   const approvalStatuses = ["all", "pending", "approved", "see notes", "rejected", "sent"];
   const filteredApprovals = approvalBase
     .filter(inv => filterLead === "all" || inv.lead === filterLead)
     .filter(inv => filterStatus === "all" || inv.status === filterStatus);
-
   const pendingCount = approvalBase.filter(inv => inv.status === "pending").length;
   const approvedCount = approvalBase.filter(inv => inv.status === "approved").length;
   const isCurrentApprovalMonthClosed = closedMonthKeys.includes(effectiveApprovalMonthKey);
   const notApprovedCount = approvalBase.filter(inv => !["approved", "sent"].includes(inv.status)).length;
   const canCloseApprovalMonth = approvalBase.length > 0 && notApprovedCount === 0;
-
   async function connectQBO() {
     setQboSyncing(true);
     setQboError("");
@@ -1064,7 +967,6 @@ export default function App() {
     }
     setQboSyncing(false);
   }
-
   async function sendInvoiceToQBO(inv) {
     if (qboSendingId) return;
     setQboSendingId(inv.id);
@@ -1076,7 +978,6 @@ export default function App() {
           amount: line.amounts[inv.monthCol],
         }))
       : [{ description: "Monthly fixed fee", amount: inv.amount }];
-
     const instruction = `Create an invoice in QuickBooks Online for the customer "${inv.clientName}" for the billing period ${inv.month}.
 Steps:
 1. Search for the customer by name. If it does not exist, create it with that name.
@@ -1085,7 +986,6 @@ Steps:
 ${JSON.stringify(lineSpec)}
 Total must be ${inv.amount}.
 Do NOT email the invoice to the customer, only create it as a draft in QuickBooks.`;
-
     try {
       const result = await qboCall(instruction);
       if (result.ok === false) throw new Error(result.summary || "QuickBooks rejected the invoice.");
@@ -1099,7 +999,6 @@ Do NOT email the invoice to the customer, only create it as a draft in QuickBook
     }
     setQboSendingId("");
   }
-
   async function resubmitInvoice(inv) {
     await saveApprovalEntry(inv.approvalMonthKey, inv.clientName, {
       status: "pending",
@@ -1107,21 +1006,18 @@ Do NOT email the invoice to the customer, only create it as a draft in QuickBook
       approver: inv.approver || "",
     });
   }
-
   async function sendAI() {
     if (!aiInput.trim() || aiLoading) return;
     const userMsg = aiInput.trim();
     setAiInput("");
     setAiMessages(prev => [...prev, { role: "user", content: userMsg }]);
     setAiLoading(true);
-
     const ctx = `You are a finance assistant for a service business agency.
 CLIENTS: ${JSON.stringify(scopedClients.map(c => ({ name: c.name, lead: c.lead, projectedAmount: c.amount, previousAmount: c.lastAmount, nextAmount: c.nextAmount, hasContract: !!c.contract, contract: c.contract ? { monthlyFee: c.contract.monthlyFee, startDate: c.contract.startDate, endDate: c.contract.endDate } : null })))}
 INVOICES: ${JSON.stringify(billingInvoices.map(i => ({ client: i.clientName, lead: i.lead, amount: i.amount, status: i.status })))}
 PROJECTED MONTH: ${currentMonthLabel}, PREVIOUS MONTH: ${lastMonthLabel}, NEXT MONTH: ${nextMonthLabel}
 TOTAL PROJECTED MONTH: ${fmt(totalProjected)}, TOTAL PREVIOUS MONTH: ${fmt(totalLast)}, TOTAL NEXT MONTH: ${fmt(totalNext)}
 Answer concisely in English. Use USD formatting.`;
-
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -1141,9 +1037,7 @@ Answer concisely in English. Use USD formatting.`;
     }
     setAiLoading(false);
   }
-
   const tabs = ["dashboard", "clients", "invoices", "invoice approvals", "closed months", "ai assistant"];
-
   if (storageLoading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -1151,7 +1045,6 @@ Answer concisely in English. Use USD formatting.`;
       </div>
     );
   }
-
   return (
     <div className="min-h-screen bg-gray-50 font-sans">
       <div className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between gap-3 flex-wrap">
@@ -1162,7 +1055,6 @@ Answer concisely in English. Use USD formatting.`;
         <div className="flex items-center gap-2 flex-wrap">
           {saving && <span className="text-xs text-gray-400">Saving...</span>}
           {saveError && <span className="text-xs font-medium text-red-500">{saveError}</span>}
-
           {monthCols.length > 0 && (
             <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-1.5">
               <span className="text-xs text-gray-400">Billing month:</span>
@@ -1184,7 +1076,22 @@ Answer concisely in English. Use USD formatting.`;
               </select>
             </div>
           )}
-
+          <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-1.5">
+            <span className="text-xs text-gray-400">Sort clients:</span>
+            <select
+              value={clientSort}
+              onChange={async e => {
+                const newSort = e.target.value;
+                setClientSort(newSort);
+                await persistSnapshot({ clientSort: newSort });
+              }}
+              className="text-xs font-medium text-gray-700 outline-none bg-transparent"
+            >
+              <option value="sheet">Sheet order</option>
+              <option value="az">A to Z</option>
+              <option value="za">Z to A</option>
+            </select>
+          </div>
           <button
             onClick={() => {
               setShowContract(true);
@@ -1197,7 +1104,6 @@ Answer concisely in English. Use USD formatting.`;
           >
             Upload Contract
           </button>
-
           {approvedCount > 0 && (
             <button
               onClick={() => {
@@ -1219,7 +1125,6 @@ Answer concisely in English. Use USD formatting.`;
               Export Approved CSV
             </button>
           )}
-
           <button
             onClick={() => {
               setShowImport(true);
@@ -1232,7 +1137,6 @@ Answer concisely in English. Use USD formatting.`;
           >
             {connected ? `Synced: ${clients.length} clients — Re-import` : "Import from Sheet"}
           </button>
-
           {qboError && <span className="text-xs font-medium text-red-500 max-w-xs truncate" title={qboError}>{qboError}</span>}
           <button
             onClick={qboConnected || qboSyncing ? undefined : connectQBO}
@@ -1245,7 +1149,6 @@ Answer concisely in English. Use USD formatting.`;
           </button>
         </div>
       </div>
-
       <div className="bg-white border-b border-gray-100 px-6 overflow-x-auto">
         <div className="flex gap-6 min-w-max">
           {tabs.map(t => (
@@ -1268,7 +1171,6 @@ Answer concisely in English. Use USD formatting.`;
           ))}
         </div>
       </div>
-
       {!connected && (
         <div className="max-w-6xl mx-auto px-6 pt-6">
           <div className="bg-blue-50 border border-blue-100 rounded-2xl px-6 py-4 text-sm text-blue-700 flex items-center justify-between">
@@ -1279,7 +1181,6 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         </div>
       )}
-
       <div className="max-w-6xl mx-auto px-6 py-8">
         {tab === "dashboard" && (
           <div className="space-y-6">
@@ -1302,7 +1203,6 @@ Answer concisely in English. Use USD formatting.`;
                 </div>
               ))}
             </div>
-
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
                 <h2 className="font-medium text-gray-800">Month Comparison by Client</h2>
@@ -1365,7 +1265,6 @@ Answer concisely in English. Use USD formatting.`;
             <NewProjectedClients clients={activeClients} currentMonthLabel={currentMonthLabel} lastMonthLabel={lastMonthLabel} />
           </div>
         )}
-
         {tab === "clients" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-2">
@@ -1388,6 +1287,19 @@ Answer concisely in English. Use USD formatting.`;
                     ))}
                   </select>
                 )}
+                <select
+                  value={clientSort}
+                  onChange={async e => {
+                    const newSort = e.target.value;
+                    setClientSort(newSort);
+                    await persistSnapshot({ clientSort: newSort });
+                  }}
+                  className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600"
+                >
+                  <option value="sheet">Sheet order</option>
+                  <option value="az">A to Z</option>
+                  <option value="za">Z to A</option>
+                </select>
                 <button
                   onClick={() => {
                     setShowContract(true);
@@ -1405,11 +1317,9 @@ Answer concisely in English. Use USD formatting.`;
                 </button>
               </div>
             </div>
-
             <div className="bg-blue-50 border border-blue-100 rounded-xl px-4 py-2 text-xs text-blue-600">
-              Click any amount in the Current or Next Month columns to edit it inline. Changes are saved automatically. You can also upload a contract PDF and the fixed fee will be loaded for every month in its term.
+              Click any amount in the Current or Next Month columns to edit it inline. Changes are saved automatically. Use the sort selector to list clients alphabetically. You can also upload a contract PDF and the fixed fee will be loaded for every month in its term.
             </div>
-
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               {scopedClients.length === 0 ? (
                 <div className="px-6 py-10 text-center text-gray-300 text-sm">No clients — import your data or upload a contract</div>
@@ -1417,7 +1327,19 @@ Answer concisely in English. Use USD formatting.`;
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-xs text-gray-400 border-b border-gray-50">
-                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-6 py-3 text-left">
+                        <button
+                          onClick={async () => {
+                            const newSort = clientSort === "az" ? "za" : "az";
+                            setClientSort(newSort);
+                            await persistSnapshot({ clientSort: newSort });
+                          }}
+                          className="hover:text-gray-600 transition-colors"
+                          title="Sort alphabetically"
+                        >
+                          Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
+                        </button>
+                      </th>
                       <th className="px-6 py-3 text-left">Lead</th>
                       <th className="px-6 py-3 text-left">Services</th>
                       <th className="px-6 py-3 text-left">Departments</th>
@@ -1486,14 +1408,12 @@ Answer concisely in English. Use USD formatting.`;
             </div>
           </div>
         )}
-
         {tab === "invoices" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-2">
               <h2 className="font-medium text-gray-800">Invoices — {currentMonthLabel || "this month"}</h2>
               {!qboConnected && <p className="text-xs text-amber-600 bg-amber-50 px-3 py-1 rounded-full">Connect QBO to enable auto-send</p>}
             </div>
-
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               {billingInvoices.length === 0 ? (
                 <div className="px-6 py-10 text-center text-gray-300 text-sm">No invoices — import your data first</div>
@@ -1501,7 +1421,19 @@ Answer concisely in English. Use USD formatting.`;
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-xs text-gray-400 border-b border-gray-50">
-                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-6 py-3 text-left">
+                        <button
+                          onClick={async () => {
+                            const newSort = clientSort === "az" ? "za" : "az";
+                            setClientSort(newSort);
+                            await persistSnapshot({ clientSort: newSort });
+                          }}
+                          className="hover:text-gray-600 transition-colors"
+                          title="Sort alphabetically"
+                        >
+                          Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
+                        </button>
+                      </th>
                       <th className="px-6 py-3 text-left">Lead</th>
                       <th className="px-6 py-3 text-right">Amount</th>
                       <th className="px-6 py-3 text-left">QBO Lines</th>
@@ -1588,7 +1520,6 @@ Answer concisely in English. Use USD formatting.`;
             </div>
           </div>
         )}
-
         {tab === "invoice approvals" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-3">
@@ -1598,7 +1529,6 @@ Answer concisely in English. Use USD formatting.`;
                   Compare projected month ({approvalContext.curLabel || "selected"}) vs previous month ({approvalContext.prevLabel || "previous"})
                 </p>
               </div>
-
               <div className="flex flex-col gap-2 items-end">
                 <div className="flex gap-2 flex-wrap justify-end items-center">
                   {approvalMonthOptions.length > 0 && (
@@ -1623,6 +1553,22 @@ Answer concisely in English. Use USD formatting.`;
                       </select>
                     </div>
                   )}
+                  <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+                    <span className="text-xs text-gray-400">Sort:</span>
+                    <select
+                      value={clientSort}
+                      onChange={async e => {
+                        const newSort = e.target.value;
+                        setClientSort(newSort);
+                        await persistSnapshot({ clientSort: newSort });
+                      }}
+                      className="text-xs font-medium text-gray-700 outline-none bg-transparent"
+                    >
+                      <option value="sheet">Sheet order</option>
+                      <option value="az">A to Z</option>
+                      <option value="za">Z to A</option>
+                    </select>
+                  </div>
                   {!isCurrentApprovalMonthClosed && (
                     <button onClick={resetApprovalsForMonth} disabled={!effectiveApprovalMonthKey} className="px-3 py-2 rounded-lg text-xs font-medium border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-40">
                       Clear approvals for this month
@@ -1649,7 +1595,6 @@ Answer concisely in English. Use USD formatting.`;
                     </button>
                   )}
                 </div>
-
                 <div className="flex gap-1 flex-wrap justify-end">
                   {approvalLeads.map(lead => (
                     <button
@@ -1663,7 +1608,6 @@ Answer concisely in English. Use USD formatting.`;
                     </button>
                   ))}
                 </div>
-
                 <div className="flex gap-1 flex-wrap justify-end">
                   {approvalStatuses.map(status => {
                     const colors = {
@@ -1688,21 +1632,18 @@ Answer concisely in English. Use USD formatting.`;
                     );
                   })}
                 </div>
-
                 <div className="flex gap-2 text-xs">
                   <span className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full">{filteredApprovals.filter(inv => inv.status === "pending").length} pending</span>
                   <span className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full">{filteredApprovals.filter(inv => inv.status === "approved").length} approved</span>
                 </div>
               </div>
             </div>
-
             {isCurrentApprovalMonthClosed && (
               <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-500 flex items-center gap-2">
                 <span>🔒</span>
                 <span><strong>{approvalContext.curLabel}</strong> is closed. Approvals are locked and cannot be changed.</span>
               </div>
             )}
-
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               {filteredApprovals.length === 0 ? (
                 <div className="px-6 py-10 text-center text-gray-300 text-sm">{approvalInvoices.length === 0 ? "No invoices — import your data first" : "No invoices for this filter"}</div>
@@ -1710,7 +1651,19 @@ Answer concisely in English. Use USD formatting.`;
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-xs text-gray-400 border-b border-gray-50">
-                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-6 py-3 text-left">
+                        <button
+                          onClick={async () => {
+                            const newSort = clientSort === "az" ? "za" : "az";
+                            setClientSort(newSort);
+                            await persistSnapshot({ clientSort: newSort });
+                          }}
+                          className="hover:text-gray-600 transition-colors"
+                          title="Sort alphabetically"
+                        >
+                          Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
+                        </button>
+                      </th>
                       <th className="px-6 py-3 text-left">Lead</th>
                       <th className="px-6 py-3 text-left">Departments</th>
                       <th className="px-6 py-3 text-right">{approvalContext.prevLabel || "Previous"}</th>
@@ -1813,7 +1766,6 @@ Answer concisely in English. Use USD formatting.`;
             </div>
           </div>
         )}
-
         {tab === "closed months" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-3">
@@ -1835,7 +1787,6 @@ Answer concisely in English. Use USD formatting.`;
                 </select>
               )}
             </div>
-
             {!selectedClosedMonth ? (
               <div className="bg-white rounded-2xl border border-gray-100 px-6 py-10 text-center text-gray-300 text-sm">
                 No closed months yet. Once all approvals are done, close the month from Invoice Approvals.
@@ -1860,7 +1811,6 @@ Answer concisely in English. Use USD formatting.`;
                     </div>
                   ))}
                 </div>
-
                 <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
                   <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
                     <h2 className="font-medium text-gray-800">Billed Invoices</h2>
@@ -1872,7 +1822,19 @@ Answer concisely in English. Use USD formatting.`;
                     <table className="w-full text-sm">
                       <thead>
                         <tr className="text-xs text-gray-400 border-b border-gray-50">
-                          <th className="px-6 py-3 text-left">Client</th>
+                          <th className="px-6 py-3 text-left">
+                            <button
+                              onClick={async () => {
+                                const newSort = clientSort === "az" ? "za" : "az";
+                                setClientSort(newSort);
+                                await persistSnapshot({ clientSort: newSort });
+                              }}
+                              className="hover:text-gray-600 transition-colors"
+                              title="Sort alphabetically"
+                            >
+                              Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
+                            </button>
+                          </th>
                           <th className="px-6 py-3 text-left">Lead</th>
                           <th className="px-6 py-3 text-right">Amount</th>
                           <th className="px-6 py-3 text-left">Status</th>
@@ -1882,7 +1844,7 @@ Answer concisely in English. Use USD formatting.`;
                         </tr>
                       </thead>
                       <tbody>
-                        {selectedClosedMonth.invoices.map(inv => (
+                        {sortClientsBy(selectedClosedMonth.invoices, clientSort, inv => inv.clientName).map(inv => (
                           <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
                             <td className="px-6 py-3 font-medium text-gray-800">{inv.clientName}</td>
                             <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
@@ -1909,7 +1871,6 @@ Answer concisely in English. Use USD formatting.`;
             )}
           </div>
         )}
-
         {tab === "ai assistant" && (
           <div className="bg-white rounded-2xl border border-gray-100 flex flex-col" style={{ height: "520px" }}>
             <div className="px-6 py-4 border-b border-gray-50">
@@ -1946,7 +1907,6 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         )}
       </div>
-
       {showContract && (
         <Modal title="Upload Contract" onClose={resetContractModal} wide>
           {contractStep === "upload" && (
@@ -1958,13 +1918,11 @@ Answer concisely in English. Use USD formatting.`;
                 <p>3. You review the extracted data and confirm</p>
                 <p>4. Billing is loaded automatically for every month within the contract term</p>
               </div>
-
               {!monthCols.length && (
                 <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
                   Import your sheet first so the dashboard knows which months exist. The contract fee is applied to the imported month columns.
                 </div>
               )}
-
               <label className="block border-2 border-dashed border-gray-200 rounded-2xl p-8 text-center cursor-pointer hover:border-blue-300 hover:bg-blue-50 transition-colors">
                 <input
                   type="file"
@@ -1987,9 +1945,7 @@ Answer concisely in English. Use USD formatting.`;
                   </div>
                 )}
               </label>
-
               {contractError && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{contractError}</p>}
-
               <div className="flex gap-3">
                 <button onClick={resetContractModal} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
                   Cancel
@@ -2004,13 +1960,11 @@ Answer concisely in English. Use USD formatting.`;
               </div>
             </div>
           )}
-
           {contractStep === "review" && contractResult && (
             <div className="space-y-4">
               <div className="bg-emerald-50 rounded-xl p-3 text-xs text-emerald-700">
                 Data extracted from <strong>{contractFile?.name}</strong>. Review and edit before confirming, then the fee will be loaded for every month within the term.
               </div>
-
               <div className="grid grid-cols-2 gap-3">
                 {[
                   ["Client name *", "clientName", "text"],
@@ -2058,13 +2012,11 @@ Answer concisely in English. Use USD formatting.`;
                   />
                 </div>
               </div>
-
               {contractResult.notes && (
                 <div className="bg-gray-50 rounded-xl p-3 text-xs text-gray-600">
                   <span className="font-medium">Contract notes:</span> {contractResult.notes}
                 </div>
               )}
-
               <div className="bg-white border border-gray-100 rounded-xl overflow-hidden">
                 <div className="px-4 py-2 border-b border-gray-50 text-xs text-gray-400">Billing preview per month</div>
                 <div className="px-4 py-2 flex flex-wrap gap-2">
@@ -2079,13 +2031,11 @@ Answer concisely in English. Use USD formatting.`;
                   })}
                 </div>
               </div>
-
               {clients.some(c => makeClientKey(c.name) === makeClientKey(contractResult.clientName)) && (
                 <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
                   This client already exists. The contract fee will be added as a new billing line on top of its current amounts.
                 </div>
               )}
-
               <div className="flex gap-3">
                 <button
                   onClick={() => setContractStep("upload")}
@@ -2105,7 +2055,6 @@ Answer concisely in English. Use USD formatting.`;
           )}
         </Modal>
       )}
-
       {showCloseConfirm && (
         <Modal title="Close Month" onClose={() => setShowCloseConfirm(false)}>
           <div className="space-y-4">
@@ -2127,7 +2076,6 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         </Modal>
       )}
-
       {showImport && (
         <Modal title="Import from Google Sheets" onClose={() => setShowImport(false)} wide>
           <div className="space-y-4">
@@ -2142,7 +2090,6 @@ Answer concisely in English. Use USD formatting.`;
                 </button>
               ))}
             </div>
-
             {importStep === "clients" && (
               <div className="space-y-3">
                 <div className="bg-blue-50 rounded-xl p-3 text-xs text-blue-700 space-y-1">
@@ -2165,7 +2112,6 @@ Answer concisely in English. Use USD formatting.`;
                 </button>
               </div>
             )}
-
             {importStep === "leads" && (
               <div className="space-y-3">
                 <div className="bg-blue-50 rounded-xl p-3 text-xs text-blue-700 space-y-1">
@@ -2195,7 +2141,6 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         </Modal>
       )}
-
       {showAddClient && (
         <Modal title="Add New Client" onClose={() => setShowAddClient(false)}>
           <div className="space-y-3">
@@ -2252,7 +2197,6 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         </Modal>
       )}
-
       {showInvoiceDetail && (
         <Modal title={`Invoice lines — ${showInvoiceDetail.clientName}`} onClose={() => setShowInvoiceDetail(null)} wide>
           <div className="space-y-3">
@@ -2298,7 +2242,6 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         </Modal>
       )}
-
       {showApprove && (
         <Modal title={`Review Invoice — ${showApprove.clientName}`} onClose={() => setShowApprove(null)}>
           <div className="space-y-4">
