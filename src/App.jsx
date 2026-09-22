@@ -120,6 +120,45 @@ function EditableCell({ value, onSave }) {
     </span>
   );
 }
+function EditableTextCell({ value, onSave, placeholder }) {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState("");
+  const ref = useRef(null);
+  function start() {
+    setVal(String(value || ""));
+    setEditing(true);
+    setTimeout(() => ref.current?.select(), 30);
+  }
+  function save() {
+    onSave(val.trim());
+    setEditing(false);
+  }
+  if (editing) {
+    return (
+      <input
+        ref={ref}
+        value={val}
+        placeholder={placeholder || ""}
+        onChange={e => setVal(e.target.value)}
+        onBlur={save}
+        onKeyDown={e => {
+          if (e.key === "Enter") save();
+          if (e.key === "Escape") setEditing(false);
+        }}
+        className="w-28 border border-blue-300 rounded px-2 py-0.5 text-xs outline-none bg-blue-50"
+      />
+    );
+  }
+  return (
+    <span
+      onClick={start}
+      title="Click to edit lead"
+      className={`cursor-pointer hover:bg-blue-50 hover:text-blue-700 px-1 py-0.5 rounded transition-colors ${value ? "text-gray-500" : "text-gray-300"}`}
+    >
+      {value || "—"}
+    </span>
+  );
+}
 function NewProjectedClients({ clients, currentMonthLabel, lastMonthLabel }) {
   const newProjected = clients.filter(c => c.amount > 0 && c.lastAmount === 0);
   if (!newProjected.length) return null;
@@ -668,6 +707,21 @@ export default function App() {
     setClients(updatedClients);
     await persistSnapshot({ clients: updatedClients });
   }
+  async function updateLead(clientId, newLead) {
+    const updatedClients = clients.map(client => {
+      if (client.id !== clientId) return client;
+      return {
+        ...client,
+        lead: newLead,
+        leadEdited: true,
+        lines: (client.lines || []).map(line => ({ ...line, lead: newLead })),
+      };
+    });
+    setClients(updatedClients);
+    const updatedApprovers = newLead && !approvers.includes(newLead) ? [...approvers, newLead] : approvers;
+    setApprovers(updatedApprovers);
+    await persistSnapshot({ clients: updatedClients, approvers: updatedApprovers });
+  }
   async function archiveClient(clientId) {
     const updatedClients = clients.map(client => (client.id === clientId ? { ...client, status: "archived" } : client));
     setClients(updatedClients);
@@ -694,6 +748,7 @@ export default function App() {
         name: newClient.name.trim(),
         status: "active",
         lead,
+        leadEdited: !!newClient.lead.trim(),
         manual: true,
         lines: [line],
       },
@@ -843,16 +898,18 @@ export default function App() {
       const importedKeys = new Set(Object.keys(grouped).map(makeClientKey));
       const importedClients = Object.values(grouped).map((group, idx) => {
         const existing = existingByKey[makeClientKey(group.name)];
-        const lead = resolveLead(group.name, group.lines[0]?.department || "", existing?.lead);
+        const keepEditedLead = !!existing?.leadEdited;
+        const lead = keepEditedLead ? existing.lead : resolveLead(group.name, group.lines[0]?.department || "", existing?.lead);
         const contractLines = (existing?.lines || []).filter(line => line.fromContract);
         return {
           id: existing?.id || `import-${idx + 1}`,
           name: group.name,
           status: existing?.status || "active",
           lead,
+          leadEdited: keepEditedLead,
           manual: false,
           contract: existing?.contract,
-          lines: [...group.lines.map(line => ({ ...line, lead: line.lead || lead })), ...contractLines],
+          lines: [...group.lines.map(line => ({ ...line, lead: keepEditedLead ? lead : line.lead || lead })), ...contractLines],
         };
       });
       const manualOnlyClients = clients.filter(client => client.manual && !importedKeys.has(makeClientKey(client.name)));
@@ -1238,7 +1295,9 @@ Answer concisely in English. Use USD formatting.`;
                               {client.name}
                               {client.contract && <span className="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">contract</span>}
                             </td>
-                            <td className="px-6 py-3 text-xs text-gray-500">{client.lead || "—"}</td>
+                            <td className="px-6 py-3 text-xs">
+                              <EditableTextCell value={client.lead} onSave={value => updateLead(client.id, value)} placeholder="Lead name" />
+                            </td>
                             <td className="px-6 py-3">
                               <div className="flex flex-wrap gap-1">
                                 {depts.map(dept => (
@@ -1318,7 +1377,7 @@ Answer concisely in English. Use USD formatting.`;
               </div>
             </div>
             <div className="bg-blue-50 border border-blue-100 rounded-xl px-4 py-2 text-xs text-blue-600">
-              Click any amount in the Current or Next Month columns to edit it inline. Changes are saved automatically. Use the sort selector to list clients alphabetically. You can also upload a contract PDF and the fixed fee will be loaded for every month in its term.
+              Click any amount in the Current or Next Month columns, or any name in the Lead column, to edit it inline. Changes are saved automatically and manually edited leads are preserved on re-import. Use the sort selector to list clients alphabetically. You can also upload a contract PDF and the fixed fee will be loaded for every month in its term.
             </div>
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               {scopedClients.length === 0 ? (
@@ -1357,7 +1416,9 @@ Answer concisely in English. Use USD formatting.`;
                       return (
                         <tr key={client.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
                           <td className="px-6 py-3 font-medium text-gray-800">{client.name}</td>
-                          <td className="px-6 py-3 text-xs text-gray-500">{client.lead || "—"}</td>
+                          <td className="px-6 py-3 text-xs">
+                            <EditableTextCell value={client.lead} onSave={value => updateLead(client.id, value)} placeholder="Lead name" />
+                          </td>
                           <td className="px-6 py-3 text-gray-500 text-xs">{services.join(", ")}</td>
                           <td className="px-6 py-3">
                             <div className="flex flex-wrap gap-1">
@@ -1456,7 +1517,9 @@ Answer concisely in English. Use USD formatting.`;
                               </button>
                             )}
                           </td>
-                          <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
+                          <td className="px-6 py-3 text-xs">
+                            <EditableTextCell value={inv.lead} onSave={value => updateLead(inv.clientId, value)} placeholder="Lead name" />
+                          </td>
                           <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.amount)}</td>
                           <td className="px-6 py-3 text-xs">
                             {inv.multiDept ? (
@@ -1692,7 +1755,13 @@ Answer concisely in English. Use USD formatting.`;
                               </button>
                             )}
                           </td>
-                          <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
+                          <td className="px-6 py-3 text-xs">
+                            {isCurrentApprovalMonthClosed ? (
+                              <span className="text-gray-500">{inv.lead || "—"}</span>
+                            ) : (
+                              <EditableTextCell value={inv.lead} onSave={value => updateLead(inv.clientId, value)} placeholder="Lead name" />
+                            )}
+                          </td>
                           <td className="px-6 py-3">
                             <div className="flex flex-wrap gap-1">
                               {depts.map(dept => (
@@ -2098,7 +2167,7 @@ Answer concisely in English. Use USD formatting.`;
                   <p>2. Click on cell <strong>D1</strong> (Client Name header)</p>
                   <p>3. Select all data from D1 to the last column and row with data</p>
                   <p>4. Copy (Ctrl+C / Cmd+C) and paste below</p>
-                  <p className="text-blue-500">Manual clients, contract lines and per-month approval history are preserved on re-import.</p>
+                  <p className="text-blue-500">Manual clients, contract lines, manually edited leads and per-month approval history are preserved on re-import.</p>
                 </div>
                 <textarea
                   value={clientPaste}
