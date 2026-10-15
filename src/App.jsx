@@ -1,16 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import * as XLSX from "xlsx";
+
+// ---------- Storage ----------
 const SUPABASE_URL = "https://hpycqegogkqsodvykqfj.supabase.co";
 const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhweWNxZWdvZ2txc29kdnlrcWZqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5NTUxMTcsImV4cCI6MjA4OTUzMTExN30.Rb5r_9gsNNVIl0e9dqYraYJdDayvunqEMfQ_I8FmfKI";
-const LOCAL_STORAGE_KEY = "invoiceflow_data_backup";
-async function loadFromSupabase() {
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.main&select=data`, {
+// v2 lives in its own row so the previous version's data is never overwritten
+const ROW_ID_V2 = "main_v2";
+const ROW_ID_V1 = "main";
+const LOCAL_KEY_V2 = "invoiceflow_data_backup_v2";
+const LOCAL_KEY_V1 = "invoiceflow_data_backup";
+const DEFAULT_MODEL_URL = "https://docs.google.com/spreadsheets/d/1K1jWmG5_Nde-T13edPxSNWXFCIESaODXQnD0RoufEPM/edit?gid=968918111#gid=968918111";
+const COMPANY_FILE_PREFIX = "Fiat_Growth";
+
+async function loadRow(id) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?id=eq.${id}&select=data`, {
     headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}` },
   });
   if (!res.ok) throw new Error(`Supabase load failed: ${res.status}`);
   const rows = await res.json();
   return rows?.[0]?.data || null;
 }
-async function saveToSupabase(data) {
+async function saveRow(id, data) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1/invoiceflow_data?on_conflict=id`, {
     method: "POST",
     headers: {
@@ -19,57 +29,549 @@ async function saveToSupabase(data) {
       "Content-Type": "application/json",
       Prefer: "resolution=merge-duplicates",
     },
-    body: JSON.stringify({ id: "main", data, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ id, data, updated_at: new Date().toISOString() }),
   });
   if (!res.ok) throw new Error(`Supabase save failed: ${res.status} ${await res.text()}`);
 }
-function loadLocalBackup() {
+function loadLocal(key) {
   try {
-    return JSON.parse(localStorage.getItem(LOCAL_STORAGE_KEY) || "null");
+    return JSON.parse(localStorage.getItem(key) || "null");
   } catch {
     return null;
   }
 }
-function saveLocalBackup(data) {
-  localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(data));
+function saveLocal(key, data) {
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch {
+    // storage unavailable or full, Supabase remains the source of truth
+  }
+}
+
+// ---------- Formatting ----------
+function round2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
 }
 function fmt(n) {
-  return "$" + Number(n || 0).toLocaleString("en-US", { minimumFractionDigits: 2 });
+  const v = Number(n || 0);
+  const s = "$" + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return v < 0 ? "-" + s : s;
 }
+function fmtSigned(n) {
+  const v = round2(n);
+  return (v > 0 ? "+" : "") + fmt(v);
+}
+function fmtPct(cur, prev) {
+  if (!prev) return cur ? "New" : "n/a";
+  const p = ((cur - prev) / Math.abs(prev)) * 100;
+  return (p > 0 ? "+" : "") + p.toFixed(1) + "%";
+}
+function varColor(diff) {
+  if (Math.abs(diff) < 0.005) return "text-gray-400";
+  return diff > 0 ? "text-emerald-600" : "text-red-500";
+}
+
+// ---------- Months (canonical key: YYYY-MM) ----------
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS_LONG = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+function ymFromParts(y, m0) {
+  return `${y}-${String(m0 + 1).padStart(2, "0")}`;
+}
+function ymSplit(ym) {
+  const [y, m] = String(ym).split("-").map(Number);
+  return { y, m0: m - 1 };
+}
+function ymLabel(ym) {
+  if (!ym) return "";
+  const { y, m0 } = ymSplit(ym);
+  return `${MONTHS_SHORT[m0]} ${y}`;
+}
+function ymLong(ym) {
+  if (!ym) return "";
+  const { y, m0 } = ymSplit(ym);
+  return `${MONTHS_LONG[m0]} ${y}`;
+}
+function ymAdd(ym, n) {
+  const { y, m0 } = ymSplit(ym);
+  const t = y * 12 + m0 + n;
+  return ymFromParts(Math.floor(t / 12), ((t % 12) + 12) % 12);
+}
+function currentYm() {
+  const d = new Date();
+  return ymFromParts(d.getFullYear(), d.getMonth());
+}
+function daysInYm(ym) {
+  const { y, m0 } = ymSplit(ym);
+  return new Date(y, m0 + 1, 0).getDate();
+}
+function monthIndexFromName(name) {
+  const k = String(name).toLowerCase().slice(0, 3);
+  return MONTHS_SHORT.findIndex(m => m.toLowerCase() === k);
+}
+function fullYear(s) {
+  const n = Number(s);
+  return String(s).length === 2 ? 2000 + n : n;
+}
+function validYm(y, m0) {
+  if (!y || y < 2000 || y > 2100 || m0 < 0 || m0 > 11) return null;
+  return ymFromParts(y, m0);
+}
+// Header cell to month key. Accepts Date, "Jan 2026", "January 2026", "Jan-26", "1/1/2026", "2026-01-01", "01/2026"
+function parseMonthCell(v) {
+  if (v instanceof Date && !Number.isNaN(v.getTime())) return ymFromParts(v.getFullYear(), v.getMonth());
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{4})-(\d{1,2})(?:-\d{1,2})?(?:[T ].*)?$/);
+  if (m) return validYm(Number(m[1]), Number(m[2]) - 1);
+  m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
+  if (m) return validYm(fullYear(m[3]), Number(m[1]) - 1);
+  m = s.match(/^(\d{1,2})\/(\d{4})$/);
+  if (m) return validYm(Number(m[2]), Number(m[1]) - 1);
+  m = s.match(/^([A-Za-z]{3,9})\.?[\s\-'’,]+(\d{2}|\d{4})$/);
+  if (m) {
+    const idx = monthIndexFromName(m[1]);
+    if (idx >= 0) return validYm(fullYear(m[2]), idx);
+  }
+  return null;
+}
+// Data cell to Date. Accepts Date, Excel serial, "10/01/2026", "2026-10-01"
+function parseDateCell(v) {
+  if (v instanceof Date && !Number.isNaN(v.getTime())) return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+  if (typeof v === "number" && v > 20000 && v < 80000) {
+    const p = XLSX.SSF.parse_date_code(v);
+    if (p) return new Date(p.y, p.m - 1, p.d);
+  }
+  const s = String(v ?? "").trim();
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2}|\d{4})$/);
+  if (m) return new Date(fullYear(m[3]), Number(m[1]) - 1, Number(m[2]));
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return null;
+}
+function isoDate(d) {
+  if (!d) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function fromIso(s) {
+  const m = String(s || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : null;
+}
+function usDate(d) {
+  if (!d) return "";
+  return `${String(d.getMonth() + 1).padStart(2, "0")}/${String(d.getDate()).padStart(2, "0")}/${d.getFullYear()}`;
+}
+function addDays(d, n) {
+  const x = new Date(d.getTime());
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+// ---------- Parsing helpers ----------
+// Returns a number, or null when the cell has no number. Handles $, commas, (1,000) and -$1,000
+function parseAmount(v) {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  const s = String(v ?? "").trim();
+  if (!s || !/\d/.test(s)) return null;
+  const neg = /^\(.*\)$/.test(s) || /^-/.test(s) || /^\$\s*-/.test(s);
+  const n = parseFloat(s.replace(/[^0-9.]/g, ""));
+  if (!Number.isFinite(n)) return null;
+  return neg ? -n : n;
+}
+const NAME_SUFFIXES = new Set(["inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation", "co", "company", "pllc", "plc", "pc", "lp", "llp", "pbc"]);
+// Normalized client key used to match the model, QBO and approvals: ignores case, punctuation and LLC/Inc
+function clientKey(name) {
+  const s = String(name || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[.,'’"()]/g, " ")
+    .replace(/[^a-z0-9: ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const key = s
+    .split(":")
+    .map(seg => seg.trim().split(" ").filter(t => t && !NAME_SUFFIXES.has(t)).join(" "))
+    .join(":");
+  return key || s;
+}
+function slug(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+function similar(a, b) {
+  const x = slug(a);
+  const y = slug(b);
+  if (!x || !y) return false;
+  return x === y || x.includes(y) || y.includes(x);
+}
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else q = false;
+      } else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else cell += c;
+  }
+  if (cell !== "" || row.length) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows;
+}
+function parseTsv(text) {
+  return String(text || "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map(r => r.split("\t"));
+}
+async function readSpreadsheetFile(file, preferSheet) {
+  const buf = await file.arrayBuffer();
+  const wb = XLSX.read(buf, { type: "array", cellDates: true });
+  const name = (preferSheet && wb.SheetNames.find(n => preferSheet.test(n))) || wb.SheetNames[0];
+  const rows = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: "" });
+  return { rows, sheetName: name };
+}
+
+// ---------- Financial model (Forecasted Revenue tab) ----------
+function modelCsvUrl(sheetUrl) {
+  const id = String(sheetUrl).match(/\/d\/([a-zA-Z0-9_-]+)/)?.[1];
+  const gid = String(sheetUrl).match(/gid=(\d+)/)?.[1] || "0";
+  if (!id) throw new Error("That does not look like a Google Sheets link.");
+  return `https://docs.google.com/spreadsheets/d/${id}/gviz/tq?tqx=out:csv&headers=1&gid=${gid}`;
+}
+function makeLineId(name, service, department) {
+  return `${clientKey(name)}|${slug(service)}|${slug(department)}`;
+}
+function parseModelRows(rows) {
+  const hIdx = rows.findIndex((r, i) => i < 30 && (r || []).some(c => String(c).trim().toLowerCase() === "client name"));
+  if (hIdx < 0) throw new Error('Could not find the "Client Name" header. Make sure the data comes from the Forecasted Revenue tab.');
+  const header = rows[hIdx];
+  const find = re => header.findIndex(h => typeof h === "string" && re.test(h.trim()));
+  const cClient = find(/^client name$/i);
+  const cService = find(/^service$/i);
+  const cDept = find(/^(department|dept)$/i);
+  const cLead = find(/^lead$/i);
+  const monthCols = [];
+  const seen = new Set();
+  header.forEach((h, i) => {
+    const ym = parseMonthCell(h);
+    if (ym && !seen.has(ym)) {
+      seen.add(ym);
+      monthCols.push({ i, ym });
+    }
+  });
+  if (!monthCols.length) throw new Error("No month columns found in the header (expected Jan 2026, Feb 2026, ...).");
+  const lines = [];
+  const idCount = {};
+  let totals = null;
+  for (let r = hIdx + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const name = String(row[cClient] ?? "").trim();
+    if (!name) continue;
+    if (/^(grand\s+)?totals?$/i.test(name)) {
+      totals = Object.fromEntries(monthCols.map(({ i, ym }) => [ym, round2(parseAmount(row[i]) || 0)]));
+      break;
+    }
+    const amounts = {};
+    let any = false;
+    monthCols.forEach(({ i, ym }) => {
+      const a = parseAmount(row[i]);
+      if (a) {
+        amounts[ym] = round2(a);
+        any = true;
+      }
+    });
+    if (!any) continue;
+    const service = cService >= 0 ? String(row[cService] ?? "").trim() : "";
+    const department = cDept >= 0 ? String(row[cDept] ?? "").trim() : "";
+    const lead = cLead >= 0 ? String(row[cLead] ?? "").trim() : "";
+    const baseId = makeLineId(name, service, department);
+    idCount[baseId] = (idCount[baseId] || 0) + 1;
+    const id = idCount[baseId] > 1 ? `${baseId}#${idCount[baseId]}` : baseId;
+    lines.push({ id, clientName: name, service, department, lead, amounts });
+  }
+  if (!lines.length) throw new Error("No client rows with amounts were found.");
+  return { lines, totals, months: monthCols.map(m => m.ym) };
+}
+
+// ---------- QBO report (actuals) ----------
+const QBO_COLS = {
+  date: [/^(transaction )?date$/i, /^invoice date$/i],
+  type: [/^(transaction )?type$/i],
+  num: [/^num$/i, /^no\.?$/i, /^invoice (no\.?|number|#)$/i, /^number$/i, /^ref(erence)? ?(no\.?|number)?$/i, /^doc(ument)? ?(no\.?|number)$/i],
+  customer: [/^customer( full name| name)?$/i, /^name$/i, /^client$/i],
+  item: [/^product\/service( full name| name)?$/i, /^item( name)?$/i, /^product( or service)?$/i],
+  description: [/^memo\/description$/i, /^(line |product\/service )?description$/i],
+  qty: [/^(qty|quantity)$/i],
+  rate: [/^(sales price|rate|price|unit price)$/i],
+  amount: [/^amount$/i, /^(line )?amount( \(usd\))?$/i, /^total( amount)?$/i],
+  class: [/^class( full name| name)?$/i],
+  location: [/^location( full name| name)?$/i],
+  terms: [/^terms$/i],
+  dueDate: [/^due date$/i],
+};
+function mapQboHeader(header) {
+  const cols = {};
+  Object.entries(QBO_COLS).forEach(([key, patterns]) => {
+    for (const re of patterns) {
+      const idx = header.findIndex(h => typeof h === "string" && re.test(h.trim()));
+      if (idx >= 0) {
+        cols[key] = idx;
+        break;
+      }
+    }
+  });
+  return cols;
+}
+function parseQboRows(rows) {
+  // Detail reports (Sales by Customer Detail, Transaction List, Invoice List)
+  for (let i = 0; i < Math.min(rows.length, 40); i++) {
+    const header = (rows[i] || []).map(c => (typeof c === "string" ? c.trim() : c));
+    const cols = mapQboHeader(header);
+    if (cols.date !== undefined && cols.amount !== undefined) return parseQboDetail(rows, i, cols);
+  }
+  // Summary reports with one column per month (Sales by Customer Summary by month)
+  for (let i = 0; i < Math.min(rows.length, 40); i++) {
+    const header = rows[i] || [];
+    const monthCols = header.map((h, idx) => ({ idx, ym: parseMonthCell(h) })).filter(x => x.ym);
+    if (monthCols.length) return parseQboSummary(rows, i, monthCols);
+  }
+  throw new Error("Could not recognize the QBO report. Export Sales by Customer Detail (or Transaction List by Customer) with Date, Num, Customer, Product/Service, Description, Class and Amount columns.");
+}
+function parseQboDetail(rows, hIdx, cols) {
+  const lines = [];
+  let group = "";
+  const get = (row, key) => (cols[key] === undefined ? "" : row[cols[key]]);
+  for (let r = hIdx + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const first = String(row.find(c => String(c).trim() !== "") ?? "").trim();
+    const date = parseDateCell(get(row, "date"));
+    const amount = parseAmount(get(row, "amount"));
+    if (!date || amount === null) {
+      if (first && !/^total/i.test(first) && !/^(tota|report|cash|accrual|basis)/i.test(first)) group = first;
+      continue;
+    }
+    const type = String(get(row, "type") || "").trim();
+    if (type && !/invoice|sales receipt|credit memo|refund/i.test(type)) continue;
+    const customer = String(get(row, "customer") || "").trim() || group;
+    if (!customer) continue;
+    const due = parseDateCell(get(row, "dueDate"));
+    lines.push({
+      ym: ymFromParts(date.getFullYear(), date.getMonth()),
+      date: isoDate(date),
+      dueDate: due ? isoDate(due) : "",
+      type,
+      num: String(get(row, "num") ?? "").trim(),
+      customer,
+      item: String(get(row, "item") || "").trim(),
+      description: String(get(row, "description") || "").trim(),
+      qty: parseAmount(get(row, "qty")),
+      rate: parseAmount(get(row, "rate")),
+      amount: round2(amount),
+      class: String(get(row, "class") || "").trim(),
+      location: String(get(row, "location") || "").trim(),
+      terms: String(get(row, "terms") || "").trim(),
+    });
+  }
+  if (!lines.length) throw new Error("The report has a header row but no invoice lines with a date and amount.");
+  return { mode: "detail", lines };
+}
+function parseQboSummary(rows, hIdx, monthCols) {
+  const lines = [];
+  for (let r = hIdx + 1; r < rows.length; r++) {
+    const row = rows[r] || [];
+    const customer = String(row[0] ?? "").trim();
+    if (!customer || /^total/i.test(customer)) continue;
+    monthCols.forEach(({ idx, ym }) => {
+      const a = parseAmount(row[idx]);
+      if (a) lines.push({ ym, date: "", dueDate: "", type: "Summary", num: "", customer, item: "", description: "", qty: null, rate: null, amount: round2(a), class: "", location: "", terms: "", summary: true });
+    });
+  }
+  if (!lines.length) throw new Error("The summary report has month columns but no customer amounts.");
+  return { mode: "summary", lines };
+}
+
+// ---------- Description roll forward ----------
+function escapeRe(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function rollDescription(text, fromYm, toYm) {
+  if (!text || !fromYm || !toYm || fromYm === toYm) return text || "";
+  const f = ymSplit(fromYm);
+  const t = ymSplit(toYm);
+  const fy = String(f.y);
+  const ty = String(t.y);
+  const pairs = [
+    [`${MONTHS_LONG[f.m0]} ${fy}`, `${MONTHS_LONG[t.m0]} ${ty}`],
+    [`${MONTHS_SHORT[f.m0]} ${fy}`, `${MONTHS_SHORT[t.m0]} ${ty}`],
+    [`${MONTHS_SHORT[f.m0]} ${fy.slice(2)}`, `${MONTHS_SHORT[t.m0]} ${ty.slice(2)}`],
+    [`${MONTHS_SHORT[f.m0]}-${fy.slice(2)}`, `${MONTHS_SHORT[t.m0]}-${ty.slice(2)}`],
+    [`${String(f.m0 + 1).padStart(2, "0")}/${fy}`, `${String(t.m0 + 1).padStart(2, "0")}/${ty}`],
+    [`${f.m0 + 1}/${fy}`, `${t.m0 + 1}/${ty}`],
+  ];
+  let out = text;
+  const tokens = [];
+  pairs.forEach(([from, to], i) => {
+    const re = new RegExp(`\\b${escapeRe(from)}\\b`, "gi");
+    out = out.replace(re, () => {
+      tokens.push(to);
+      return `\u0000${tokens.length - 1}\u0000`;
+    });
+  });
+  out = out.replace(new RegExp(`\\b${MONTHS_LONG[f.m0]}\\b`, "g"), MONTHS_LONG[t.m0]);
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => tokens[Number(i)]);
+}
+function parseTermsDays(terms) {
+  const s = String(terms || "").toLowerCase();
+  const m = s.match(/net\s*(\d+)/);
+  if (m) return Number(m[1]);
+  if (/receipt/.test(s)) return 0;
+  return null;
+}
+
+// ---------- Data shape ----------
 const DEPT_DEFAULT_LEADS = { "fiat finance": "Kaley", uncovered: "Nick" };
-function getDefaultLead(d) {
-  return DEPT_DEFAULT_LEADS[d?.toLowerCase().trim()] || "";
+function getDefaultLead(dept) {
+  return DEPT_DEFAULT_LEADS[String(dept || "").toLowerCase().trim()] || "";
 }
-function makeClientKey(name) {
-  return String(name || "").trim().toLowerCase();
+function defaultBillingMonth() {
+  return ymAdd(currentYm(), 1);
 }
-function sortClientsBy(list, mode, getName = item => item.name) {
-  if (mode === "sheet" || !mode) return list;
-  const sorted = [...(list || [])].sort((a, b) =>
-    String(getName(a) || "").localeCompare(String(getName(b) || ""), "en", { sensitivity: "base" })
-  );
-  return mode === "za" ? sorted.reverse() : sorted;
+function emptyData() {
+  return {
+    version: 2,
+    forecast: { lines: [], totals: null, syncedAt: "", source: "", sheetUrl: DEFAULT_MODEL_URL },
+    actuals: { lines: [], uploads: [] },
+    customerMap: {},
+    overrides: {},
+    manualLines: {},
+    leadOverrides: {},
+    approvers: [],
+    approvalHistory: {},
+    closedMonths: [],
+    billingMonth: defaultBillingMonth(),
+    invoiceFieldMemory: {},
+    exportSettings: { autoNumber: false },
+    clientSort: "az",
+    savedAt: "",
+  };
 }
+function normalizeData(d) {
+  const base = emptyData();
+  if (!d || d.version !== 2) return base;
+  return {
+    ...base,
+    ...d,
+    forecast: { ...base.forecast, ...(d.forecast || {}) },
+    actuals: { ...base.actuals, ...(d.actuals || {}) },
+    exportSettings: { ...base.exportSettings, ...(d.exportSettings || {}) },
+  };
+}
+function oldKeyToYm(key) {
+  return parseMonthCell(key) || (/^\d{4}-\d{2}$/.test(String(key)) ? key : null);
+}
+// Converts data saved by the previous dashboard version into the v2 shape
+function migrateV1(v1) {
+  const d = emptyData();
+  if (!v1) return d;
+  const idCount = {};
+  (v1.clients || []).forEach(client => {
+    (client.lines || []).forEach(line => {
+      const amounts = {};
+      Object.entries(line.amounts || {}).forEach(([k, v]) => {
+        const ym = oldKeyToYm(k);
+        if (ym && Number(v)) amounts[ym] = round2(v);
+      });
+      if (!Object.keys(amounts).length) return;
+      const baseId = makeLineId(client.name, line.service, line.department);
+      idCount[baseId] = (idCount[baseId] || 0) + 1;
+      const id = idCount[baseId] > 1 ? `${baseId}#${idCount[baseId]}` : baseId;
+      d.forecast.lines.push({ id, clientName: client.name, service: line.service || "", department: line.department || "", lead: "", amounts });
+    });
+    if (client.lead) d.leadOverrides[clientKey(client.name)] = client.lead;
+  });
+  d.forecast.source = d.forecast.lines.length ? "Carried over from the previous dashboard version. Sync the financial model to refresh." : "";
+  d.approvers = v1.approvers || [];
+  const history = v1.approvalHistory || {};
+  Object.entries(history).forEach(([monthKey, entries]) => {
+    const ym = oldKeyToYm(monthKey);
+    if (!ym) return;
+    d.approvalHistory[ym] = d.approvalHistory[ym] || {};
+    Object.entries(entries || {}).forEach(([oldKey, entry]) => {
+      d.approvalHistory[ym][clientKey(oldKey)] = { ...entry };
+    });
+  });
+  d.closedMonths = (v1.closedMonths || [])
+    .filter(m => typeof m === "object" && m)
+    .map(m => ({ ...m, monthKey: oldKeyToYm(m.monthKey) || m.monthKey, previousMonthKey: oldKeyToYm(m.previousMonthKey) || m.previousMonthKey }));
+  const savedMonth = oldKeyToYm(v1.approvalMonthKey || v1.curColKey || "");
+  d.billingMonth = savedMonth && savedMonth >= currentYm() ? savedMonth : defaultBillingMonth();
+  return d;
+}
+function setIn(obj, path, value) {
+  const [head, ...rest] = path;
+  const src = obj || {};
+  if (!rest.length) {
+    const next = { ...src };
+    if (value === undefined) delete next[head];
+    else next[head] = value;
+    return next;
+  }
+  return { ...src, [head]: setIn(src[head], rest, value) };
+}
+function downloadBlob(content, fileName, type) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([content], { type }));
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+function toCsv(rows) {
+  return rows.map(row => row.map(cell => `"${String(cell ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
+}
+
+// ---------- UI atoms ----------
 function Badge({ status }) {
   const s = {
-    active: "bg-emerald-50 text-emerald-700",
     pending: "bg-amber-50 text-amber-700",
     approved: "bg-blue-50 text-blue-700",
     sent: "bg-purple-50 text-purple-700",
     rejected: "bg-red-50 text-red-700",
-    archived: "bg-gray-100 text-gray-500",
     "see notes": "bg-orange-50 text-orange-600",
+    edited: "bg-blue-50 text-blue-600",
+    removed: "bg-gray-100 text-gray-500",
+    added: "bg-emerald-50 text-emerald-700",
+    actuals: "bg-emerald-50 text-emerald-700",
+    forecast: "bg-gray-100 text-gray-500",
   };
-  return (
-    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${s[status] || "bg-gray-100 text-gray-500"}`}>
-      {status.charAt(0).toUpperCase() + status.slice(1)}
-    </span>
-  );
+  const label = status === "sent" ? "Exported" : status.charAt(0).toUpperCase() + status.slice(1);
+  return <span className={`px-2 py-0.5 rounded-full text-xs font-medium whitespace-nowrap ${s[status] || "bg-gray-100 text-gray-500"}`}>{label}</span>;
 }
-function Modal({ title, onClose, children, wide }) {
+function Modal({ title, onClose, children, size }) {
+  const width = size === "xl" ? "max-w-6xl" : size === "wide" ? "max-w-3xl" : "max-w-md";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-20 p-4">
-      <div className={`bg-white rounded-2xl shadow-xl w-full ${wide ? "max-w-3xl" : "max-w-md"} p-6 max-h-[90vh] overflow-y-auto`}>
+      <div className={`bg-white rounded-2xl shadow-xl w-full ${width} p-6 max-h-[92vh] overflow-y-auto`}>
         <div className="flex items-center justify-between mb-4">
           <h3 className="font-semibold text-gray-800 text-lg">{title}</h3>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xl leading-none">
@@ -81,18 +583,19 @@ function Modal({ title, onClose, children, wide }) {
     </div>
   );
 }
-function EditableCell({ value, onSave }) {
+function EditableAmount({ value, onSave, disabled, muted }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState("");
   const ref = useRef(null);
   function start() {
+    if (disabled) return;
     setVal(String(value || 0));
     setEditing(true);
     setTimeout(() => ref.current?.select(), 30);
   }
   function save() {
-    const n = parseFloat(String(val).replace(/[$,]/g, "")) || 0;
-    onSave(n);
+    const n = parseAmount(val);
+    if (n !== null) onSave(round2(n));
     setEditing(false);
   }
   if (editing) {
@@ -106,31 +609,32 @@ function EditableCell({ value, onSave }) {
           if (e.key === "Enter") save();
           if (e.key === "Escape") setEditing(false);
         }}
-        className="w-24 border border-blue-300 rounded px-2 py-0.5 text-right text-xs outline-none bg-blue-50"
+        className="w-28 border border-blue-300 rounded px-2 py-0.5 text-right text-xs outline-none bg-blue-50"
       />
     );
   }
   return (
     <span
       onClick={start}
-      title="Click to edit"
-      className="cursor-pointer hover:bg-blue-50 hover:text-blue-700 px-1 py-0.5 rounded transition-colors font-medium text-gray-800"
+      title={disabled ? "" : "Click to edit"}
+      className={`${disabled ? "" : "cursor-pointer hover:bg-blue-50 hover:text-blue-700"} px-1 py-0.5 rounded transition-colors font-medium ${muted ? "text-gray-300 line-through" : "text-gray-800"}`}
     >
       {fmt(value)}
     </span>
   );
 }
-function EditableTextCell({ value, onSave, placeholder }) {
+function EditableText({ value, onSave, placeholder, disabled, className }) {
   const [editing, setEditing] = useState(false);
   const [val, setVal] = useState("");
   const ref = useRef(null);
   function start() {
+    if (disabled) return;
     setVal(String(value || ""));
     setEditing(true);
     setTimeout(() => ref.current?.select(), 30);
   }
   function save() {
-    onSave(val.trim());
+    if (val.trim() !== String(value || "")) onSave(val.trim());
     setEditing(false);
   }
   if (editing) {
@@ -145,1513 +649,1075 @@ function EditableTextCell({ value, onSave, placeholder }) {
           if (e.key === "Enter") save();
           if (e.key === "Escape") setEditing(false);
         }}
-        className="w-28 border border-blue-300 rounded px-2 py-0.5 text-xs outline-none bg-blue-50"
+        className={`border border-blue-300 rounded px-2 py-0.5 text-xs outline-none bg-blue-50 ${className || "w-28"}`}
       />
     );
   }
   return (
     <span
       onClick={start}
-      title="Click to edit lead"
-      className={`cursor-pointer hover:bg-blue-50 hover:text-blue-700 px-1 py-0.5 rounded transition-colors ${value ? "text-gray-500" : "text-gray-300"}`}
+      title={disabled ? "" : "Click to edit"}
+      className={`${disabled ? "" : "cursor-pointer hover:bg-blue-50 hover:text-blue-700"} px-1 py-0.5 rounded transition-colors whitespace-nowrap ${value ? "text-gray-600" : "text-gray-300"}`}
     >
-      {value || "—"}
+      {value || placeholder || "n/a"}
     </span>
   );
 }
-function NewProjectedClients({ clients, currentMonthLabel, lastMonthLabel }) {
-  const newProjected = clients.filter(c => c.amount > 0 && c.lastAmount === 0);
-  if (!newProjected.length) return null;
+function StatCard({ label, value, sub, color }) {
   return (
-    <div className="bg-white rounded-2xl border border-emerald-100 overflow-hidden">
-      <div className="px-6 py-4 border-b border-emerald-50 flex items-center justify-between">
-        <h2 className="font-medium text-emerald-700">New in projected month</h2>
-        <span className="text-xs text-emerald-500">
-          {newProjected.length} client{newProjected.length > 1 ? "s" : ""} have projected billing but no previous-month billing
-        </span>
-      </div>
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="text-xs text-gray-400 border-b border-gray-50">
-            <th className="px-6 py-3 text-left">Client</th>
-            <th className="px-6 py-3 text-left">Lead</th>
-            <th className="px-6 py-3 text-left">Departments</th>
-            <th className="px-6 py-3 text-right">{lastMonthLabel || "Previous Month"}</th>
-            <th className="px-6 py-3 text-right">{currentMonthLabel || "Projected Month"}</th>
-          </tr>
-        </thead>
-        <tbody>
-          {newProjected.map(c => {
-            const depts = [...new Set(c.lines.map(l => l.department))].filter(Boolean);
-            return (
-              <tr key={c.id} className="border-b border-gray-50 hover:bg-emerald-50 transition-colors">
-                <td className="px-6 py-3 font-medium text-gray-800">{c.name}</td>
-                <td className="px-6 py-3 text-xs text-gray-500">{c.lead || "—"}</td>
-                <td className="px-6 py-3">
-                  <div className="flex flex-wrap gap-1">
-                    {depts.map(d => (
-                      <span key={d} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">
-                        {d}
-                      </span>
-                    ))}
-                  </div>
-                </td>
-                <td className="px-6 py-3 text-right text-gray-500">$0.00</td>
-                <td className="px-6 py-3 text-right font-medium text-emerald-600">{fmt(c.amount)}</td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+    <div className="bg-white rounded-2xl p-5 border border-gray-100">
+      <p className="text-xs text-gray-400 mb-1">{label}</p>
+      <p className={`text-2xl font-semibold ${color || "text-gray-900"}`}>{value}</p>
+      {sub && <p className="text-xs text-gray-400 mt-1">{sub}</p>}
     </div>
   );
 }
-function parseColDate(header) {
-  const h = String(header);
-  let m = h.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (m) return new Date(Number(m[3]), Number(m[1]) - 1, 1);
-  const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
-  m = h.match(/^([A-Za-z]{3})\s+(\d{4})$/);
-  if (m) {
-    const mo = months.indexOf(m[1].toLowerCase());
-    if (mo >= 0) return new Date(Number(m[2]), mo, 1);
+function Card({ title, subtitle, right, children, tone }) {
+  const border = tone === "red" ? "border-red-100" : tone === "green" ? "border-emerald-100" : "border-gray-100";
+  const titleColor = tone === "red" ? "text-red-600" : tone === "green" ? "text-emerald-700" : "text-gray-800";
+  return (
+    <div className={`bg-white rounded-2xl border ${border} overflow-hidden`}>
+      <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h2 className={`font-medium ${titleColor}`}>{title}</h2>
+          {subtitle && <p className="text-xs text-gray-400 mt-0.5">{subtitle}</p>}
+        </div>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// ---------- Billing model ----------
+function lineAmountFor(line, ym, overrides) {
+  const ov = overrides?.[ym]?.[line.id];
+  if (ov?.removed) return 0;
+  if (ov && ov.amount !== undefined) return ov.amount;
+  return line.amounts?.[ym] || 0;
+}
+function buildBillingModel(data) {
+  const M = data.billingMonth;
+  const P = ymAdd(M, -1);
+  const forecastLines = data.forecast.lines || [];
+  const modelNames = {};
+  forecastLines.forEach(l => {
+    const k = clientKey(l.clientName);
+    if (!modelNames[k]) modelNames[k] = l.clientName;
+  });
+  Object.values(data.manualLines || {}).forEach(list =>
+    (list || []).forEach(l => {
+      const k = clientKey(l.clientName);
+      if (!modelNames[k]) modelNames[k] = l.clientName;
+    })
+  );
+  // QBO customer to client key
+  const autoKey = qboName => {
+    const k = clientKey(qboName);
+    if (modelNames[k]) return { key: k, matched: true };
+    if (qboName.includes(":")) {
+      const parent = clientKey(qboName.split(":")[0]);
+      if (modelNames[parent]) return { key: parent, matched: true };
+    }
+    return { key: k, matched: false };
+  };
+  const resolveCustomer = qboName => {
+    const mapped = data.customerMap?.[qboName];
+    if (mapped) return mapped;
+    return autoKey(qboName).key;
+  };
+  const actualLines = data.actuals.lines || [];
+  const actualMonths = new Set(actualLines.map(l => l.ym));
+  const actualsByYm = {};
+  const actualLinesByClient = {};
+  const latestQboName = {};
+  const latestQboDate = {};
+  const qboCustomers = {};
+  actualLines.forEach(l => {
+    const key = resolveCustomer(l.customer);
+    actualsByYm[l.ym] = actualsByYm[l.ym] || {};
+    actualsByYm[l.ym][key] = round2((actualsByYm[l.ym][key] || 0) + l.amount);
+    (actualLinesByClient[key] = actualLinesByClient[key] || []).push(l);
+    const sortDate = l.date || `${l.ym}-01`;
+    if (!latestQboDate[key] || sortDate >= latestQboDate[key]) {
+      latestQboDate[key] = sortDate;
+      latestQboName[key] = l.customer;
+    }
+    if (!qboCustomers[l.customer]) qboCustomers[l.customer] = { name: l.customer, ...autoKey(l.customer), total: 0 };
+    qboCustomers[l.customer].total = round2(qboCustomers[l.customer].total + l.amount);
+  });
+  Object.values(actualLinesByClient).forEach(list => list.sort((a, b) => String(b.date || b.ym).localeCompare(String(a.date || a.ym))));
+
+  const prevSource = actualMonths.has(P) ? "actuals" : "forecast";
+  const clients = {};
+  const ensure = (key, name) => {
+    if (!clients[key]) clients[key] = { key, name: modelNames[key] || name, lines: [], amount: 0, prevAmount: 0, departments: new Set() };
+    return clients[key];
+  };
+  forecastLines.forEach(line => {
+    const key = clientKey(line.clientName);
+    const modelAmount = line.amounts?.[M] || 0;
+    const ov = data.overrides?.[M]?.[line.id];
+    if (!modelAmount && !ov) return;
+    const amount = lineAmountFor(line, M, data.overrides);
+    const c = ensure(key, line.clientName);
+    c.lines.push({ ...line, modelAmount, amount, edited: !!ov && !ov.removed, removed: !!ov?.removed, manual: false });
+    if (amount && line.department) c.departments.add(line.department);
+  });
+  (data.manualLines?.[M] || []).forEach(line => {
+    const key = clientKey(line.clientName);
+    const c = ensure(key, line.clientName);
+    c.lines.push({ ...line, modelAmount: 0, amount: line.amount, manual: true });
+    if (line.department) c.departments.add(line.department);
+  });
+  // previous month amounts
+  if (prevSource === "actuals") {
+    Object.entries(actualsByYm[P] || {}).forEach(([key, amt]) => {
+      ensure(key, latestQboName[key] || key).prevAmount = amt;
+    });
+  } else {
+    forecastLines.forEach(line => {
+      const a = lineAmountFor(line, P, data.overrides);
+      if (a) {
+        const c = ensure(clientKey(line.clientName), line.clientName);
+        c.prevAmount = round2(c.prevAmount + a);
+      }
+    });
+    (data.manualLines?.[P] || []).forEach(line => {
+      const c = ensure(clientKey(line.clientName), line.clientName);
+      c.prevAmount = round2(c.prevAmount + (line.amount || 0));
+    });
   }
+  const leadFor = c => {
+    if (data.leadOverrides?.[c.key]) return data.leadOverrides[c.key];
+    const fromModel = c.lines.find(l => l.lead)?.lead;
+    if (fromModel) return fromModel;
+    const deptLead = c.lines.map(l => getDefaultLead(l.department)).find(Boolean);
+    return deptLead || "";
+  };
+  const rows = Object.values(clients).map(c => {
+    const amount = round2(c.lines.reduce((s, l) => s + (l.amount || 0), 0));
+    return {
+      ...c,
+      amount,
+      departments: [...c.departments],
+      lead: leadFor(c),
+      diff: round2(amount - c.prevAmount),
+      qboName: latestQboName[c.key] || "",
+    };
+  });
+  const active = rows.filter(r => Math.abs(r.amount) > 0.004 || Math.abs(r.prevAmount) > 0.004);
+  const lost = active.filter(r => Math.abs(r.amount) < 0.005 && Math.abs(r.prevAmount) > 0.004);
+  const added = active.filter(r => Math.abs(r.amount) > 0.004 && Math.abs(r.prevAmount) < 0.005);
+  const total = round2(active.reduce((s, r) => s + r.amount, 0));
+  const prevTotal = round2(active.reduce((s, r) => s + r.prevAmount, 0));
+  const monthSet = new Set([M, P, currentYm(), ymAdd(currentYm(), 1)]);
+  forecastLines.forEach(l => Object.keys(l.amounts || {}).forEach(k => monthSet.add(k)));
+  actualMonths.forEach(m => monthSet.add(m));
+  const monthOptions = [...monthSet].sort();
+  const modelTotalForM = forecastLines.reduce((s, l) => s + (l.amounts?.[M] || 0), 0);
+  return {
+    M,
+    P,
+    prevSource,
+    rows: active,
+    lost,
+    added,
+    total,
+    prevTotal,
+    monthOptions,
+    modelNames,
+    qboCustomers: Object.values(qboCustomers),
+    actualLinesByClient,
+    actualsByYm,
+    actualMonths: [...actualMonths].sort(),
+    latestQboName,
+    modelTotalForM: round2(modelTotalForM),
+  };
+}
+
+// ---------- QBO import file ----------
+function pickTemplate(billingLine, templateLines) {
+  if (!templateLines.length) return null;
+  const s = billingLine.service;
+  const byItem = templateLines.find(t => t.item && similar(t.item.split(":").pop(), s));
+  if (byItem) return byItem;
+  const byDesc = templateLines.find(t => t.description && s && slug(t.description).includes(slug(s)));
+  if (byDesc) return byDesc;
+  const items = [...new Set(templateLines.map(t => t.item))];
+  if (items.length === 1) return templateLines[0];
+  const byClass = templateLines.filter(t => t.class && similar(t.class.split(":").pop(), billingLine.department));
+  if (byClass.length && new Set(byClass.map(t => t.item)).size === 1) return byClass[0];
   return null;
 }
-function formatMonthLabel(d) {
-  if (!d || !(d instanceof Date) || Number.isNaN(d.getTime())) return "";
-  return d.toLocaleString("en-US", { month: "short", year: "numeric" });
-}
-function labelFromKey(key) {
-  if (!key) return "";
-  const d = parseColDate(key);
-  return d ? formatMonthLabel(d) : key;
-}
-function parsePaste(text) {
-  return text
-    .trim()
-    .split("\n")
-    .map(r => r.split("\t").map(c => c.trim()));
-}
-function rowsToObjects(rows) {
-  if (rows.length < 2) return { objects: [], headers: [] };
-  const headers = rows[0];
-  const objects = rows
-    .slice(1)
-    .filter(r => r.some(c => c))
-    .map(row => Object.fromEntries(headers.map((h, i) => [h, row[i] ?? ""])));
-  return { objects, headers };
-}
-function parseAmount(val) {
-  if (!val) return 0;
-  return parseFloat(String(val).replace(/[$,\s]/g, "")) || 0;
-}
-function getMonthCols(headers) {
-  return headers
-    .map((h, i) => ({ h, i, d: parseColDate(h) }))
-    .filter(x => x.d)
-    .sort((a, b) => a.d - b.d);
-}
-function normalizeMonthCols(savedCols, savedClients = []) {
-  const fromSaved = (savedCols || [])
-    .map((col, idx) => ({ h: col.h, i: col.i ?? idx, d: parseColDate(col.h) }))
-    .filter(col => col.h && col.d);
-  if (fromSaved.length) return fromSaved.sort((a, b) => a.d - b.d);
-  const keys = new Set();
-  (savedClients || []).forEach(client => {
-    (client.lines || []).forEach(line => {
-      Object.keys(line.amounts || {}).forEach(key => {
-        if (parseColDate(key)) keys.add(key);
+function buildExport(data, bm, options) {
+  const M = data.billingMonth;
+  const memory = data.invoiceFieldMemory || {};
+  const allActual = data.actuals.lines || [];
+  const usesClass = allActual.some(l => l.class);
+  const usesLocation = allActual.some(l => l.location);
+  const statusOf = key => data.approvalHistory?.[M]?.[key]?.status || "pending";
+  const included = bm.rows.filter(r => Math.abs(r.amount) > 0.004).filter(r => {
+    const st = statusOf(r.key);
+    if (options.scope === "all") return true;
+    if (options.scope === "approved_sent") return st === "approved" || st === "sent";
+    return st === "approved";
+  });
+  // invoice date
+  let invoiceDate = fromIso(options.invoiceDate);
+  if (!invoiceDate) {
+    const { y, m0 } = ymSplit(M);
+    invoiceDate = new Date(y, m0, 1);
+  }
+  // numbering
+  const maxNum = allActual.reduce((mx, l) => (/^\d+$/.test(l.num) ? Math.max(mx, Number(l.num)) : mx), 0);
+  let nextNo = options.autoNumber ? null : Number(options.startNo) || maxNum + 1;
+  const invoices = [];
+  const exceptions = [];
+  const sorted = [...included].sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
+  sorted.forEach(client => {
+    const history = (bm.actualLinesByClient[client.key] || []).filter(l => !l.summary);
+    const templateYm = history[0]?.ym || "";
+    const templateLines = history.filter(l => l.ym === templateYm);
+    const customerMemory = memory[`customer|${client.key}`] || {};
+    const customer = customerMemory.customer || client.qboName || client.name;
+    const lastTerms = history.find(l => l.terms)?.terms || "";
+    const lastWithDue = history.find(l => l.dueDate && l.date);
+    const lines = [];
+    client.lines
+      .filter(l => !l.removed && Math.abs(l.amount) > 0.004)
+      .forEach(l => {
+        const t = pickTemplate(l, templateLines);
+        const mem = memory[l.id] || {};
+        const memDesc = mem.description ? rollDescription(mem.description, mem.descriptionYm || M, M) : "";
+        const tDesc = t?.description ? rollDescription(t.description, t.ym, M) : "";
+        const line = {
+          lineId: l.id,
+          service: l.service,
+          department: l.department,
+          item: mem.item ?? t?.item ?? "",
+          description: memDesc || tDesc || `${l.service || "Services"}, ${ymLong(M)}`,
+          class: mem.class ?? t?.class ?? "",
+          qty: 1,
+          rate: round2(l.amount),
+          amount: round2(l.amount),
+          location: t?.location || "",
+          templateFound: !!t,
+        };
+        lines.push(line);
+        if (!line.item) exceptions.push({ type: "Missing Product/Service", customer, detail: `${l.service || "Line"} ${fmt(l.amount)}, set the QBO item before importing` });
+        if (usesClass && !line.class) exceptions.push({ type: "Missing Class", customer, detail: `${l.service || "Line"} ${fmt(l.amount)}, set the QBO class before importing` });
       });
-    });
-  });
-  return [...keys]
-    .map((h, i) => ({ h, i, d: parseColDate(h) }))
-    .filter(col => col.d)
-    .sort((a, b) => a.d - b.d);
-}
-function getMonthContext(cols, key) {
-  if (!cols.length) {
-    return {
-      curKey: "",
-      nextKey: "",
-      prevKey: "",
-      curLabel: "",
-      nextLabel: "",
-      prevLabel: "",
-    };
-  }
-  const fallback = cols[cols.length - 2] || cols[cols.length - 1];
-  const current = (key && cols.find(c => c.h === key)) || fallback;
-  const idx = cols.findIndex(c => c.h === current.h);
-  const prev = idx > 0 ? cols[idx - 1] : null;
-  const next = idx < cols.length - 1 ? cols[idx + 1] : null;
-  return {
-    curKey: current?.h || "",
-    nextKey: next?.h || "",
-    prevKey: prev?.h || "",
-    curLabel: current ? formatMonthLabel(current.d) : "",
-    nextLabel: next ? formatMonthLabel(next.d) : "",
-    prevLabel: prev ? formatMonthLabel(prev.d) : "",
-  };
-}
-function sumForMonth(lines, monthKey) {
-  if (!monthKey) return 0;
-  return (lines || []).reduce((sum, line) => sum + (line.amounts?.[monthKey] || 0), 0);
-}
-function enrichClientForContext(client, ctx) {
-  const lines = client.lines || [];
-  return {
-    ...client,
-    amount: sumForMonth(lines, ctx.curKey),
-    lastAmount: sumForMonth(lines, ctx.prevKey),
-    nextAmount: sumForMonth(lines, ctx.nextKey),
-    multiDept: new Set(lines.map(l => l.department).filter(Boolean)).size > 1,
-  };
-}
-function cloneLinesWithAdjustedTotal(lines, monthKey, newTotal) {
-  const nextLines = (lines || []).map(line => ({
-    ...line,
-    amounts: { ...(line.amounts || {}) },
-  }));
-  if (!monthKey || !nextLines.length) return nextLines;
-  const currentTotal = nextLines.reduce((sum, line) => sum + (line.amounts?.[monthKey] || 0), 0);
-  const delta = newTotal - currentTotal;
-  if (nextLines.length === 1) {
-    nextLines[0].amounts[monthKey] = newTotal;
-    return nextLines;
-  }
-  let targetIdx = 0;
-  let biggest = -Infinity;
-  nextLines.forEach((line, idx) => {
-    const val = line.amounts?.[monthKey] || 0;
-    if (val > biggest) {
-      biggest = val;
-      targetIdx = idx;
+    if (!lines.length) return;
+    const terms = customerMemory.terms ?? lastTerms;
+    const termDays = parseTermsDays(terms);
+    let due = null;
+    if (termDays !== null) due = addDays(invoiceDate, termDays);
+    else if (lastWithDue) {
+      const gap = Math.round((fromIso(lastWithDue.dueDate) - fromIso(lastWithDue.date)) / 86400000);
+      if (Number.isFinite(gap)) due = addDays(invoiceDate, gap);
     }
-  });
-  nextLines[targetIdx].amounts[monthKey] = (nextLines[targetIdx].amounts?.[monthKey] || 0) + delta;
-  return nextLines;
-}
-function buildInvoiceRecord(client, ctx, approvalHistory, defaultApprover) {
-  const approvalMonthKey = ctx.curKey;
-  const stored = approvalHistory?.[approvalMonthKey]?.[makeClientKey(client.name)] || {};
-  const lines = client.lines || [];
-  return {
-    id: `${approvalMonthKey}-${client.id}`,
-    clientId: client.id,
-    clientName: client.name,
-    amount: sumForMonth(lines, ctx.curKey),
-    lastAmount: sumForMonth(lines, ctx.prevKey),
-    nextAmount: sumForMonth(lines, ctx.nextKey),
-    approver: stored.approver || client.approver || defaultApprover || "",
-    lead: client.lead || "",
-    status: stored.status || "pending",
-    comment: stored.comment || "",
-    month: ctx.curLabel,
-    monthCol: ctx.curKey,
-    previousMonthCol: ctx.prevKey,
-    nextMonthCol: ctx.nextKey,
-    approvalMonthKey,
-    lines,
-    multiDept: new Set(lines.map(l => l.department).filter(Boolean)).size > 1,
-  };
-}
-function migrateApprovalHistory(legacyInvoices) {
-  const history = {};
-  (legacyInvoices || []).forEach(inv => {
-    const monthKey = inv.monthCol || "";
-    const clientKey = makeClientKey(inv.clientName);
-    if (!monthKey || !clientKey) return;
-    history[monthKey] = history[monthKey] || {};
-    history[monthKey][clientKey] = {
-      status: inv.status || "pending",
-      comment: inv.comment || "",
-      approver: inv.approver || "",
-    };
-  });
-  return history;
-}
-function normalizeClosedMonths(value) {
-  return (value || []).map(item => (typeof item === "string" ? { monthKey: item, monthLabel: labelFromKey(item), closedAt: "", invoices: [] } : item));
-}
-function buildClosedMonthRecord(monthKey, ctx, invoices) {
-  const snapshotInvoices = (invoices || [])
-    .filter(inv => inv.amount > 0)
-    .map(inv => ({
-      id: inv.id,
-      clientId: inv.clientId,
-      clientName: inv.clientName,
-      lead: inv.lead,
-      approver: inv.approver,
-      status: inv.status,
-      comment: inv.comment,
-      amount: inv.amount,
-      lastAmount: inv.lastAmount,
-      month: inv.month,
-      monthCol: inv.monthCol,
-      previousMonthCol: inv.previousMonthCol,
-      multiDept: inv.multiDept,
-      lines: (inv.lines || [])
-        .filter(line => (line.amounts?.[inv.monthCol] || 0) > 0)
-        .map(line => ({
-          service: line.service,
-          department: line.department,
-          lead: line.lead,
-          amount: line.amounts?.[inv.monthCol] || 0,
-        })),
-    }));
-  return {
-    monthKey,
-    monthLabel: ctx.curLabel,
-    previousMonthKey: ctx.prevKey,
-    previousMonthLabel: ctx.prevLabel,
-    closedAt: new Date().toISOString(),
-    total: snapshotInvoices.reduce((sum, inv) => sum + inv.amount, 0),
-    invoiceCount: snapshotInvoices.length,
-    approvedCount: snapshotInvoices.filter(inv => inv.status === "approved").length,
-    sentCount: snapshotInvoices.filter(inv => inv.status === "sent").length,
-    invoices: snapshotInvoices,
-  };
-}
-// ---------- QuickBooks via MCP ----------
-const QBO_MCP = { type: "url", url: "https://ai-inc.quickbooks.intuit.com/v1/mcp", name: "quickbooks-mcp" };
-async function qboCall(instruction, systemNote) {
-  let res;
-  try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        system:
-          systemNote ||
-          "You are an invoicing agent for a service agency. Use the QuickBooks tools to complete the task. When done, reply with a single short JSON object: {\"ok\": true|false, \"summary\": string, \"invoiceId\": string}. No markdown fences, no extra text.",
-        messages: [{ role: "user", content: instruction }],
-        mcp_servers: [QBO_MCP],
-      }),
+    invoices.push({
+      key: client.key,
+      no: nextNo === null ? "" : String(nextNo++),
+      customer,
+      clientName: client.name,
+      date: invoiceDate,
+      due,
+      terms,
+      location: lines[0]?.location || "",
+      lines,
+      total: round2(lines.reduce((s, l) => s + l.amount, 0)),
+      prevAmount: client.prevAmount,
+      newCustomer: !history.length && !client.qboName,
     });
-  } catch {
-    throw new Error("Network error reaching the AI API. If running outside claude.ai this call is blocked by CORS.");
-  }
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`QBO call failed (${res.status}). ${errText.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("\n") || "";
-  const clean = text.replace(/```json|```/g, "").trim();
-  try {
-    return JSON.parse(clean);
-  } catch {
-    return { ok: true, summary: clean.slice(0, 300), invoiceId: "" };
-  }
-}
-// ---------- Contract parsing helpers ----------
-function fileToBase64(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result).split(",")[1]);
-    reader.onerror = () => reject(new Error("Could not read the file"));
-    reader.readAsDataURL(file);
+    if (!history.length && !client.qboName) exceptions.push({ type: "New customer", customer, detail: "No invoices for this customer in the QBO actuals. Confirm the exact QBO customer name before importing." });
+    if (client.prevAmount && Math.abs(client.amount - client.prevAmount) / Math.abs(client.prevAmount) > 0.1)
+      exceptions.push({ type: "Variance over 10%", customer, detail: `${fmt(client.prevAmount)} in ${ymLabel(bm.P)} vs ${fmt(client.amount)} in ${ymLabel(M)} (${fmtPct(client.amount, client.prevAmount)})` });
   });
+  bm.rows
+    .filter(r => Math.abs(r.amount) > 0.004 && !included.includes(r))
+    .forEach(r => exceptions.push({ type: "Not included", customer: r.qboName || r.name, detail: `${fmt(r.amount)}, approval status is ${statusOf(r.key)}` }));
+  bm.lost.forEach(r => exceptions.push({ type: "No billing this month", customer: r.qboName || r.name, detail: `Billed ${fmt(r.prevAmount)} in ${ymLabel(bm.P)}, nothing in ${ymLabel(M)}` }));
+  const priority = ["Missing Product/Service", "Missing Class", "New customer", "Variance over 10%", "No billing this month", "Not included"];
+  exceptions.sort((a, b) => priority.indexOf(a.type) - priority.indexOf(b.type));
+  const actionable = exceptions.filter(e => e.type !== "Not included").length;
+  const total = round2(invoices.reduce((s, i) => s + i.total, 0));
+  return { invoices, exceptions, actionable, total, usesLocation, usesClass, maxNum, invoiceDate };
 }
-function monthKeyToYearMonth(key) {
-  const d = parseColDate(key);
-  if (!d) return null;
-  return d.getFullYear() * 12 + d.getMonth();
-}
-function yearMonthFromString(s) {
-  // Accepts "YYYY-MM" or "YYYY-MM-DD"
-  const m = String(s || "").match(/^(\d{4})-(\d{2})/);
-  if (!m) return null;
-  return Number(m[1]) * 12 + (Number(m[2]) - 1);
-}
-const MAX_CONTRACT_MB = 8;
-async function parseContractWithAI(file) {
-  if (file.size > MAX_CONTRACT_MB * 1024 * 1024) {
-    throw new Error(`The file is ${(file.size / 1024 / 1024).toFixed(1)} MB. Please use a PDF under ${MAX_CONTRACT_MB} MB, ideally the contract pages with the fee and term only.`);
-  }
-  const base64Data = await fileToBase64(file);
-  const system = `You are a contract data extractor for a service agency's invoicing system.
-Read the attached contract and extract the billing details.
-Respond ONLY with a valid JSON object, no markdown fences, no preamble, with exactly these keys:
-{
-  "clientName": string,            // the client / counterparty company name
-  "service": string,               // short description of the contracted service
-  "department": string,            // department if identifiable, otherwise ""
-  "monthlyFee": number,            // the fixed monthly fee as a plain number, no currency symbols
-  "currency": string,              // e.g. "USD"
-  "startDate": string,             // contract start in YYYY-MM format, "" if not found
-  "endDate": string,               // contract end in YYYY-MM format, "" if open-ended or not found
-  "notes": string                  // anything relevant for billing: setup fees, escalations, payment terms
-}
-If the fee is stated annually, divide by 12. If multiple fees exist, use the recurring monthly fixed fee.`;
-  let res;
-  try {
-    res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-6",
-        max_tokens: 1000,
-        system,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64Data } },
-              { type: "text", text: "Extract the billing details from this contract as JSON." },
-            ],
-          },
-        ],
-      }),
+function exportCsv(exp, M) {
+  const cols = ["InvoiceNo", "Customer", "InvoiceDate", "DueDate", "Terms"];
+  if (exp.usesLocation) cols.push("Location");
+  cols.push("Memo", "Item(Product/Service)", "ItemDescription", "ItemQuantity", "ItemRate", "ItemAmount", "Class");
+  const rows = [cols];
+  exp.invoices.forEach(inv => {
+    inv.lines.forEach(l => {
+      const r = [inv.no, inv.customer, usDate(inv.date), usDate(inv.due), inv.terms];
+      if (exp.usesLocation) r.push(inv.location);
+      r.push("", l.item, l.description, "1", l.amount.toFixed(2), l.amount.toFixed(2), l.class);
+      rows.push(r);
     });
-  } catch {
-    throw new Error("Network error calling the AI API (Failed to fetch). If you are running this app outside claude.ai, direct browser calls to api.anthropic.com are blocked by CORS and need a backend proxy. If you are inside claude.ai, try a smaller PDF or check your connection.");
-  }
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`The AI API returned ${res.status}. ${errText.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("\n") || "";
-  const clean = text.replace(/```json|```/g, "").trim();
-  let parsed;
-  try {
-    parsed = JSON.parse(clean);
-  } catch {
-    throw new Error("The AI response could not be read as structured data. Try again or use a clearer PDF.");
-  }
-  return {
-    clientName: String(parsed.clientName || "").trim(),
-    service: String(parsed.service || "").trim(),
-    department: String(parsed.department || "").trim(),
-    monthlyFee: Number(parsed.monthlyFee) || 0,
-    currency: String(parsed.currency || "USD").trim(),
-    startDate: String(parsed.startDate || "").trim(),
-    endDate: String(parsed.endDate || "").trim(),
-    notes: String(parsed.notes || "").trim(),
-  };
+  });
+  downloadBlob("﻿" + toCsv(rows), `${COMPANY_FILE_PREFIX}_Invoices_Import_${M}.csv`, "text/csv;charset=utf-8");
 }
+function exportReviewWorkbook(exp, bm, data) {
+  const M = data.billingMonth;
+  const recon = [["Customer", `${ymLabel(bm.P)} (${bm.prevSource === "actuals" ? "QBO actuals" : "forecast"})`, ymLabel(M), "Variance", "Variance %", "Approval status", "Comment"]];
+  [...bm.rows]
+    .sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }))
+    .forEach(r => {
+      const entry = data.approvalHistory?.[M]?.[r.key] || {};
+      recon.push([r.qboName || r.name, r.prevAmount, r.amount, r.diff, r.prevAmount ? round2((r.diff / Math.abs(r.prevAmount)) * 100) / 100 : "", entry.status || (r.amount ? "pending" : ""), entry.comment || ""]);
+    });
+  recon.push(["Total", bm.prevTotal, bm.total, round2(bm.total - bm.prevTotal), bm.prevTotal ? round2((bm.total - bm.prevTotal) / Math.abs(bm.prevTotal) * 10000) / 10000 : "", "", ""]);
+  const exc = [["Type", "Customer", "Detail"], ...exp.exceptions.map(e => [e.type, e.customer, e.detail])];
+  const lines = [["InvoiceNo", "Customer", "Service", "Department", "Item(Product/Service)", "Description", "Class", "Amount"]];
+  exp.invoices.forEach(inv => inv.lines.forEach(l => lines.push([inv.no, inv.customer, l.service, l.department, l.item, l.description, l.class, l.amount])));
+  const wb = XLSX.utils.book_new();
+  const ws1 = XLSX.utils.aoa_to_sheet(recon);
+  ws1["!cols"] = [{ wch: 44 }, { wch: 22 }, { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 16 }, { wch: 40 }];
+  for (let r = 1; r < recon.length; r++) {
+    ["B", "C", "D"].forEach(c => {
+      const cell = ws1[`${c}${r + 1}`];
+      if (cell && typeof cell.v === "number") cell.z = "#,##0.00;(#,##0.00)";
+    });
+    const pct = ws1[`E${r + 1}`];
+    if (pct && typeof pct.v === "number") pct.z = "0.0%";
+  }
+  const ws2 = XLSX.utils.aoa_to_sheet(exc);
+  ws2["!cols"] = [{ wch: 24 }, { wch: 44 }, { wch: 90 }];
+  const ws3 = XLSX.utils.aoa_to_sheet(lines);
+  ws3["!cols"] = [{ wch: 10 }, { wch: 40 }, { wch: 22 }, { wch: 16 }, { wch: 30 }, { wch: 50 }, { wch: 18 }, { wch: 12 }];
+  XLSX.utils.book_append_sheet(wb, ws1, "Reconciliation");
+  XLSX.utils.book_append_sheet(wb, ws2, "Exceptions");
+  XLSX.utils.book_append_sheet(wb, ws3, "Invoice Lines");
+  XLSX.writeFile(wb, `${COMPANY_FILE_PREFIX}_Invoice_Review_${M}.xlsx`);
+}
+
+// ---------- App ----------
 export default function App() {
-  const [storageLoading, setStorageLoading] = useState(true);
-  const [tab, setTab] = useState("dashboard");
-  const [showImport, setShowImport] = useState(false);
-  const [importStep, setImportStep] = useState("clients");
-  const [clientPaste, setClientPaste] = useState("");
-  const [leadPaste, setLeadPaste] = useState("");
-  const [importError, setImportError] = useState("");
-  const [showAddClient, setShowAddClient] = useState(false);
-  const [newClient, setNewClient] = useState({ name: "", service: "", department: "", lead: "", currentAmt: "", nextAmt: "" });
-  const [rawRows, setRawRows] = useState([]);
-  const [clients, setClients] = useState([]);
-  const [approvers, setApprovers] = useState([]);
-  const [approvalHistory, setApprovalHistory] = useState({});
-  const [monthCols, setMonthCols] = useState([]);
-  const [connected, setConnected] = useState(false);
-  const [curColKey, setCurColKey] = useState("");
-  const [approvalMonthKey, setApprovalMonthKey] = useState("");
-  const [closedMonths, setClosedMonths] = useState([]);
-  const [selectedClosedMonthKey, setSelectedClosedMonthKey] = useState("");
-  const [showCloseConfirm, setShowCloseConfirm] = useState(false);
-  const [showApprove, setShowApprove] = useState(null);
-  const [showInvoiceDetail, setShowInvoiceDetail] = useState(null);
-  const [approveComment, setApproveComment] = useState("");
-  const [qboConnected, setQboConnected] = useState(false);
-  const [qboSyncing, setQboSyncing] = useState(false);
-  const [qboCompany, setQboCompany] = useState("");
-  const [qboError, setQboError] = useState("");
-  const [qboSendingId, setQboSendingId] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState(emptyData);
+  const dataRef = useRef(data);
+  const saveChain = useRef(Promise.resolve());
+  const pending = useRef(0);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
-  // Client sorting: "sheet" | "az" | "za"
-  const [clientSort, setClientSort] = useState("sheet");
-  // Contract upload state
-  const [showContract, setShowContract] = useState(false);
-  const [contractStep, setContractStep] = useState("upload"); // upload | review
-  const [contractFile, setContractFile] = useState(null);
-  const [contractParsing, setContractParsing] = useState(false);
-  const [contractError, setContractError] = useState("");
-  const [contractResult, setContractResult] = useState(null);
-  const [aiMessages, setAiMessages] = useState([
-    { role: "assistant", content: "Hi! Import your data from Google Sheets and then ask me anything about your clients, invoices, or monthly performance." },
-  ]);
-  const [aiInput, setAiInput] = useState("");
-  const [aiLoading, setAiLoading] = useState(false);
-  const chatEndRef = useRef(null);
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [aiMessages]);
-  const billingContext = useMemo(() => getMonthContext(monthCols, curColKey), [monthCols, curColKey]);
-  const approvalMonthOptions = useMemo(() => monthCols, [monthCols]);
-  const effectiveApprovalMonthKey = approvalMonthKey || billingContext.curKey || approvalMonthOptions[approvalMonthOptions.length - 1]?.h || "";
-  const approvalContext = useMemo(() => getMonthContext(monthCols, effectiveApprovalMonthKey), [monthCols, effectiveApprovalMonthKey]);
-  const currentMonthLabel = billingContext.curLabel;
-  const lastMonthLabel = billingContext.prevLabel;
-  const nextMonthLabel = billingContext.nextLabel;
-  const scopedClients = useMemo(
-    () => sortClientsBy(clients.map(client => enrichClientForContext(client, billingContext)), clientSort),
-    [clients, billingContext, clientSort]
-  );
-  const billingInvoices = useMemo(
-    () => scopedClients.map(client => buildInvoiceRecord(client, billingContext, approvalHistory, approvers[0] || "")),
-    [scopedClients, billingContext, approvalHistory, approvers]
-  );
-  const approvalInvoices = useMemo(
-    () =>
-      sortClientsBy(
-        clients.map(client => buildInvoiceRecord(enrichClientForContext(client, approvalContext), approvalContext, approvalHistory, approvers[0] || "")),
-        clientSort,
-        inv => inv.clientName
-      ),
-    [clients, approvalContext, approvalHistory, approvers, clientSort]
-  );
-  const closedMonthRecords = useMemo(() => normalizeClosedMonths(closedMonths), [closedMonths]);
-  const closedMonthKeys = useMemo(() => closedMonthRecords.map(month => month.monthKey), [closedMonthRecords]);
-  const selectedClosedMonth = useMemo(
-    () => closedMonthRecords.find(month => month.monthKey === selectedClosedMonthKey) || closedMonthRecords[closedMonthRecords.length - 1] || null,
-    [closedMonthRecords, selectedClosedMonthKey]
-  );
-  function buildSnapshot(overrides = {}) {
-    return {
-      rawRows: overrides.rawRows ?? rawRows,
-      clients: overrides.clients ?? clients,
-      approvers: overrides.approvers ?? approvers,
-      approvalHistory: overrides.approvalHistory ?? approvalHistory,
-      monthCols: (overrides.monthCols ?? monthCols).map((col, idx) => ({ h: col.h, i: col.i ?? idx })),
-      curColKey: overrides.curColKey ?? billingContext.curKey,
-      approvalMonthKey: overrides.approvalMonthKey ?? effectiveApprovalMonthKey,
-      closedMonths: overrides.closedMonths ?? closedMonthRecords,
-      connected: overrides.connected ?? connected,
-      clientSort: overrides.clientSort ?? clientSort,
-    };
-  }
-  async function persistSnapshot(overrides = {}) {
-    setSaving(true);
-    setSaveError("");
-    const snapshot = buildSnapshot(overrides);
-    saveLocalBackup(snapshot);
-    try {
-      await saveToSupabase(snapshot);
-    } catch (error) {
-      console.error(error);
-      setSaveError("Saved locally. Supabase save failed.");
-    }
-    setSaving(false);
-  }
-  useEffect(() => {
-    async function load() {
-      try {
-        const d = (await loadFromSupabase()) || loadLocalBackup();
-        const loadedClients = d?.clients || [];
-        if (loadedClients.length || d?.rawRows?.length) {
-          const loadedMonthCols = normalizeMonthCols(d.monthCols || [], loadedClients);
-          const initialContext = getMonthContext(loadedMonthCols, d.curColKey || "");
-          const initialApprovalKey = d.approvalMonthKey || initialContext.curKey || "";
-          setRawRows(d.rawRows || []);
-          setClients(loadedClients);
-          setApprovers(d.approvers || []);
-          setApprovalHistory(d.approvalHistory || migrateApprovalHistory(d.invoices));
-          const loadedClosedMonths = normalizeClosedMonths(d.closedMonths || []);
-          setClosedMonths(loadedClosedMonths);
-          setSelectedClosedMonthKey(loadedClosedMonths[loadedClosedMonths.length - 1]?.monthKey || "");
-          setMonthCols(loadedMonthCols);
-          setCurColKey(initialContext.curKey);
-          setApprovalMonthKey(initialApprovalKey);
-          setClientSort(d.clientSort || "sheet");
-          setConnected(true);
-          setAiMessages([{ role: "assistant", content: `Data loaded: ${loadedClients.length} clients. Ask me anything!` }]);
-        }
-      } catch (error) {
-        console.error(error);
-        const d = loadLocalBackup();
-        const loadedClients = d?.clients || [];
-        if (loadedClients.length || d?.rawRows?.length) {
-          const loadedMonthCols = normalizeMonthCols(d.monthCols || [], loadedClients);
-          const initialContext = getMonthContext(loadedMonthCols, d.curColKey || "");
-          const initialApprovalKey = d.approvalMonthKey || initialContext.curKey || "";
-          setRawRows(d.rawRows || []);
-          setClients(loadedClients);
-          setApprovers(d.approvers || []);
-          setApprovalHistory(d.approvalHistory || migrateApprovalHistory(d.invoices));
-          const loadedClosedMonths = normalizeClosedMonths(d.closedMonths || []);
-          setClosedMonths(loadedClosedMonths);
-          setSelectedClosedMonthKey(loadedClosedMonths[loadedClosedMonths.length - 1]?.monthKey || "");
-          setMonthCols(loadedMonthCols);
-          setCurColKey(initialContext.curKey);
-          setApprovalMonthKey(initialApprovalKey);
-          setClientSort(d.clientSort || "sheet");
-          setConnected(true);
-          setSaveError("Loaded local backup. Supabase load failed.");
-          setAiMessages([{ role: "assistant", content: `Local backup loaded: ${loadedClients.length} clients. Supabase needs attention.` }]);
-        } else {
-          setSaveError("Could not load saved data from Supabase.");
-        }
-      }
-      setStorageLoading(false);
-    }
-    load();
-  }, []);
-  async function updateAmount(clientId, field, newVal) {
-    const monthKey = field === "amount" ? billingContext.curKey : billingContext.nextKey;
-    if (!monthKey) return;
-    const updatedClients = clients.map(client => {
-      if (client.id !== clientId) return client;
-      return {
-        ...client,
-        lines: cloneLinesWithAdjustedTotal(client.lines, monthKey, newVal),
-      };
-    });
-    setClients(updatedClients);
-    await persistSnapshot({ clients: updatedClients });
-  }
-  async function updateLead(clientId, newLead) {
-    const updatedClients = clients.map(client => {
-      if (client.id !== clientId) return client;
-      return {
-        ...client,
-        lead: newLead,
-        leadEdited: true,
-        lines: (client.lines || []).map(line => ({ ...line, lead: newLead })),
-      };
-    });
-    setClients(updatedClients);
-    const updatedApprovers = newLead && !approvers.includes(newLead) ? [...approvers, newLead] : approvers;
-    setApprovers(updatedApprovers);
-    await persistSnapshot({ clients: updatedClients, approvers: updatedApprovers });
-  }
-  async function archiveClient(clientId) {
-    const updatedClients = clients.map(client => (client.id === clientId ? { ...client, status: "archived" } : client));
-    setClients(updatedClients);
-    await persistSnapshot({ clients: updatedClients });
-  }
-  async function addClientManually() {
-    if (!newClient.name.trim()) return;
-    const id = `manual-${Date.now()}`;
-    const curAmt = parseFloat(newClient.currentAmt) || 0;
-    const nextAmt = parseFloat(newClient.nextAmt) || 0;
-    const lead = newClient.lead.trim() || getDefaultLead(newClient.department) || "";
-    const line = {
-      _id: id,
-      clientName: newClient.name.trim(),
-      service: newClient.service,
-      department: newClient.department,
-      lead,
-      amounts: { [billingContext.curKey]: curAmt, [billingContext.nextKey]: nextAmt },
-    };
-    const updatedClients = [
-      ...clients,
-      {
-        id,
-        name: newClient.name.trim(),
-        status: "active",
-        lead,
-        leadEdited: !!newClient.lead.trim(),
-        manual: true,
-        lines: [line],
-      },
-    ];
-    setClients(updatedClients);
-    setShowAddClient(false);
-    setNewClient({ name: "", service: "", department: "", lead: "", currentAmt: "", nextAmt: "" });
-    await persistSnapshot({ clients: updatedClients, connected: true });
-  }
-  // ---------- Contract flow ----------
-  function resetContractModal() {
-    setShowContract(false);
-    setContractStep("upload");
-    setContractFile(null);
-    setContractParsing(false);
-    setContractError("");
-    setContractResult(null);
-  }
-  async function handleParseContract() {
-    if (!contractFile) return;
-    setContractParsing(true);
-    setContractError("");
-    try {
-      const result = await parseContractWithAI(contractFile);
-      if (!result.clientName) throw new Error("Could not identify the client name in the contract.");
-      if (!result.monthlyFee) throw new Error("Could not identify a monthly fixed fee in the contract.");
-      setContractResult(result);
-      setContractStep("review");
-    } catch (e) {
-      setContractError(e.message || "Could not parse the contract. Try another file.");
-    }
-    setContractParsing(false);
-  }
-  function buildContractAmounts(result) {
-    const startYM = yearMonthFromString(result.startDate);
-    const endYM = yearMonthFromString(result.endDate);
-    const amounts = {};
-    monthCols.forEach(col => {
-      const ym = monthKeyToYearMonth(col.h);
-      if (ym === null) return;
-      const afterStart = startYM === null || ym >= startYM;
-      const beforeEnd = endYM === null || ym <= endYM;
-      amounts[col.h] = afterStart && beforeEnd ? result.monthlyFee : 0;
-    });
-    return amounts;
-  }
-  async function applyContract() {
-    if (!contractResult || !monthCols.length) return;
-    const result = contractResult;
-    const amounts = buildContractAmounts(result);
-    const key = makeClientKey(result.clientName);
-    const existing = clients.find(c => makeClientKey(c.name) === key);
-    const lead = existing?.lead || getDefaultLead(result.department) || "";
-    const contractMeta = {
-      fileName: contractFile?.name || "contract.pdf",
-      monthlyFee: result.monthlyFee,
-      currency: result.currency,
-      startDate: result.startDate,
-      endDate: result.endDate,
-      notes: result.notes,
-      parsedAt: new Date().toISOString(),
-    };
-    const newLine = {
-      _id: `contract-${Date.now()}`,
-      clientName: result.clientName,
-      service: result.service || "Fixed fee (contract)",
-      department: result.department || "",
-      lead,
-      fromContract: true,
-      amounts,
-    };
-    let updatedClients;
-    if (existing) {
-      updatedClients = clients.map(c =>
-        c.id === existing.id ? { ...c, contract: contractMeta, lines: [...(c.lines || []), newLine] } : c
-      );
-    } else {
-      updatedClients = [
-        ...clients,
-        {
-          id: `contract-${Date.now()}`,
-          name: result.clientName,
-          status: "active",
-          lead,
-          manual: true,
-          contract: contractMeta,
-          lines: [newLine],
-        },
-      ];
-    }
-    setClients(updatedClients);
-    resetContractModal();
-    setAiMessages(prev => [
-      ...prev,
-      { role: "assistant", content: `Contract loaded for ${result.clientName}: ${fmt(result.monthlyFee)} / month${result.startDate ? `, from ${result.startDate}` : ""}${result.endDate ? ` to ${result.endDate}` : ""}. Billing was added automatically.` },
-    ]);
-    await persistSnapshot({ clients: updatedClients, connected: true });
-  }
-  async function processImport() {
-    setImportError("");
-    try {
-      const clientRows = parsePaste(clientPaste);
-      const { objects, headers } = rowsToObjects(clientRows);
-      if (!objects.length) throw new Error("No data found. Make sure to include the header row.");
-      const cols = getMonthCols(headers);
-      if (!cols.length) throw new Error("No month columns found. Expected format: 01/01/2025 or Jan 2025.");
-      const importContext = getMonthContext(cols, curColKey);
-      const nameKey = headers.find(h => /client.*name|^client$/i.test(h));
-      const serviceKey = headers.find(h => /^service$/i.test(h));
-      const deptKey = headers.find(h => /department|dept/i.test(h));
-      if (!nameKey) throw new Error("Could not find a 'Client Name' column.");
-      let leadMap = {};
-      let approverNames = [];
-      if (leadPaste.trim()) {
-        const leadRows = parsePaste(leadPaste);
-        const { objects: leadObjects, headers: leadHeaders } = rowsToObjects(leadRows);
-        const clientCol = leadHeaders.find(h => /^client$/i.test(h)) || leadHeaders[0];
-        const leadCol = leadHeaders.find(h => /^lead$/i.test(h)) || leadHeaders[1];
-        leadObjects.forEach(row => {
-          const clientName = row[clientCol]?.trim();
-          const leadName = row[leadCol]?.trim();
-          if (clientName && leadName) leadMap[makeClientKey(clientName)] = leadName;
-        });
-        approverNames = [...new Set(leadObjects.map(row => row[leadCol]).filter(Boolean))];
-      }
-      const resolveLead = (name, dept, existingLead) => leadMap[makeClientKey(name)] || existingLead || getDefaultLead(dept) || "";
-      const enriched = objects
-        .filter(row => row[nameKey]?.trim())
-        .map((row, idx) => {
-          const dept = deptKey ? row[deptKey] || "" : "";
-          const clientName = row[nameKey].trim();
-          return {
-            _id: idx,
-            clientName,
-            service: serviceKey ? row[serviceKey] || "" : "",
-            department: dept,
-            lead: resolveLead(clientName, dept, ""),
-            amounts: Object.fromEntries(cols.map(c => [c.h, parseAmount(row[c.h])])),
-          };
-        });
-      const grouped = {};
-      enriched.forEach(row => {
-        if (!grouped[row.clientName]) grouped[row.clientName] = { name: row.clientName, lines: [] };
-        grouped[row.clientName].lines.push(row);
-      });
-      const existingByKey = Object.fromEntries(clients.map(client => [makeClientKey(client.name), client]));
-      const importedKeys = new Set(Object.keys(grouped).map(makeClientKey));
-      const importedClients = Object.values(grouped).map((group, idx) => {
-        const existing = existingByKey[makeClientKey(group.name)];
-        const keepEditedLead = !!existing?.leadEdited;
-        const lead = keepEditedLead ? existing.lead : resolveLead(group.name, group.lines[0]?.department || "", existing?.lead);
-        const contractLines = (existing?.lines || []).filter(line => line.fromContract);
-        return {
-          id: existing?.id || `import-${idx + 1}`,
-          name: group.name,
-          status: existing?.status || "active",
-          lead,
-          leadEdited: keepEditedLead,
-          manual: false,
-          contract: existing?.contract,
-          lines: [...group.lines.map(line => ({ ...line, lead: keepEditedLead ? lead : line.lead || lead })), ...contractLines],
-        };
-      });
-      const manualOnlyClients = clients.filter(client => client.manual && !importedKeys.has(makeClientKey(client.name)));
-      const updatedClients = [...importedClients, ...manualOnlyClients];
-      const updatedApprovers = approverNames.length ? approverNames : approvers;
-      const updatedApprovalMonthKey = cols.find(c => c.h === effectiveApprovalMonthKey) ? effectiveApprovalMonthKey : importContext.curKey;
-      setRawRows(enriched);
-      setClients(updatedClients);
-      setApprovers(updatedApprovers);
-      setMonthCols(cols);
-      setCurColKey(importContext.curKey);
-      setApprovalMonthKey(updatedApprovalMonthKey);
-      setConnected(true);
-      setShowImport(false);
-      setClientPaste("");
-      setLeadPaste("");
-      setImportStep("clients");
-      setAiMessages([{ role: "assistant", content: `Synced ${updatedClients.length} clients with ${enriched.length} service lines. Ask me anything!` }]);
-      await persistSnapshot({
-        rawRows: enriched,
-        clients: updatedClients,
-        approvers: updatedApprovers,
-        monthCols: cols,
-        curColKey: importContext.curKey,
-        approvalMonthKey: updatedApprovalMonthKey,
-        connected: true,
-      });
-    } catch (e) {
-      setImportError(e.message);
-    }
-  }
-  async function saveApprovalEntry(monthKey, clientName, patch) {
-    const clientKey = makeClientKey(clientName);
-    const updatedApprovalHistory = {
-      ...approvalHistory,
-      [monthKey]: {
-        ...(approvalHistory[monthKey] || {}),
-        [clientKey]: {
-          ...(approvalHistory[monthKey]?.[clientKey] || {}),
-          ...patch,
-        },
-      },
-    };
-    setApprovalHistory(updatedApprovalHistory);
-    await persistSnapshot({ approvalHistory: updatedApprovalHistory });
-  }
-  async function approveInvoice(decision) {
-    if (!showApprove) return;
-    await saveApprovalEntry(showApprove.approvalMonthKey, showApprove.clientName, {
-      status: decision,
-      comment: approveComment,
-      approver: showApprove.approver || "",
-    });
-    setApproveComment("");
-    setShowApprove(null);
-  }
-  async function resetApprovalsForMonth() {
-    if (!effectiveApprovalMonthKey) return;
-    const updatedApprovalHistory = { ...approvalHistory };
-    delete updatedApprovalHistory[effectiveApprovalMonthKey];
-    setApprovalHistory(updatedApprovalHistory);
-    await persistSnapshot({ approvalHistory: updatedApprovalHistory });
-  }
-  async function closeMonth() {
-    if (!effectiveApprovalMonthKey) return;
-    if (!canCloseApprovalMonth) return;
-    const monthRecord = buildClosedMonthRecord(effectiveApprovalMonthKey, approvalContext, approvalBase);
-    const updatedClosed = [...closedMonthRecords.filter(month => month.monthKey !== effectiveApprovalMonthKey), monthRecord];
-    setClosedMonths(updatedClosed);
-    setSelectedClosedMonthKey(effectiveApprovalMonthKey);
-    setShowCloseConfirm(false);
-    const nextKey = approvalContext.nextKey;
-    if (nextKey) {
-      setApprovalMonthKey(nextKey);
-      setCurColKey(nextKey);
-      await persistSnapshot({ closedMonths: updatedClosed, approvalMonthKey: nextKey, curColKey: nextKey });
-    } else {
-      await persistSnapshot({ closedMonths: updatedClosed });
-    }
-  }
-  const activeClients = scopedClients.filter(client => client.status === "active");
-  const totalProjected = activeClients.reduce((sum, client) => sum + client.amount, 0);
-  const totalLast = activeClients.reduce((sum, client) => sum + client.lastAmount, 0);
-  const totalNext = activeClients.reduce((sum, client) => sum + client.nextAmount, 0);
+  const [notice, setNotice] = useState("");
+  const [tab, setTab] = useState("billing");
+  const [expanded, setExpanded] = useState({});
+  const [sortMode, setSortMode] = useState("az");
+  const [showAddLine, setShowAddLine] = useState(false);
+  const [newLine, setNewLine] = useState({ clientName: "", service: "", department: "", amount: "" });
+  const [showApprove, setShowApprove] = useState(null);
+  const [approveComment, setApproveComment] = useState("");
+  const [approveApprover, setApproveApprover] = useState("");
+  const [showLines, setShowLines] = useState(null);
   const [filterLead, setFilterLead] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
-  const approvalBase = approvalInvoices.filter(inv => inv.amount > 0);
-  const approvalLeads = ["all", ...new Set(approvalBase.map(inv => inv.lead).filter(Boolean))];
-  const approvalStatuses = ["all", "pending", "approved", "see notes", "rejected", "sent"];
-  const filteredApprovals = approvalBase
-    .filter(inv => filterLead === "all" || inv.lead === filterLead)
-    .filter(inv => filterStatus === "all" || inv.status === filterStatus);
-  const pendingCount = approvalBase.filter(inv => inv.status === "pending").length;
-  const approvedCount = approvalBase.filter(inv => inv.status === "approved").length;
-  const isCurrentApprovalMonthClosed = closedMonthKeys.includes(effectiveApprovalMonthKey);
-  const notApprovedCount = approvalBase.filter(inv => !["approved", "sent"].includes(inv.status)).length;
-  const canCloseApprovalMonth = approvalBase.length > 0 && notApprovedCount === 0;
-  async function connectQBO() {
-    setQboSyncing(true);
-    setQboError("");
-    try {
-      const result = await qboCall(
-        "Get the QuickBooks company information and confirm the connection.",
-        'You verify a QuickBooks connection. Use the company info tool. Reply only with JSON: {"ok": true|false, "summary": "<company name>"}. No markdown, no extra text.'
-      );
-      if (result.ok === false) throw new Error(result.summary || "QuickBooks did not respond.");
-      setQboConnected(true);
-      setQboCompany(result.summary || "");
-    } catch (e) {
-      setQboError(e.message);
-      setQboConnected(false);
-    }
-    setQboSyncing(false);
-  }
-  async function sendInvoiceToQBO(inv) {
-    if (qboSendingId) return;
-    setQboSendingId(inv.id);
-    setQboError("");
-    const activeLines = (inv.lines || []).filter(line => (line.amounts?.[inv.monthCol] || 0) > 0);
-    const lineSpec = activeLines.length
-      ? activeLines.map(line => ({
-          description: [line.service, line.department].filter(Boolean).join(" — ") || "Monthly fixed fee",
-          amount: line.amounts[inv.monthCol],
-        }))
-      : [{ description: "Monthly fixed fee", amount: inv.amount }];
-    const instruction = `Create an invoice in QuickBooks Online for the customer "${inv.clientName}" for the billing period ${inv.month}.
-Steps:
-1. Search for the customer by name. If it does not exist, create it with that name.
-2. Search the product/service catalog for a suitable generic service item (e.g. "Services" or "Hours"). If none exists, create one named "Monthly Services".
-3. Create the invoice with these lines (one line per entry, description and amount in USD):
-${JSON.stringify(lineSpec)}
-Total must be ${inv.amount}.
-Do NOT email the invoice to the customer, only create it as a draft in QuickBooks.`;
-    try {
-      const result = await qboCall(instruction);
-      if (result.ok === false) throw new Error(result.summary || "QuickBooks rejected the invoice.");
-      await saveApprovalEntry(inv.approvalMonthKey, inv.clientName, {
-        status: "sent",
-        comment: result.invoiceId ? `QBO invoice ${result.invoiceId}` : result.summary || inv.comment || "",
-        approver: inv.approver || "",
-      });
-    } catch (e) {
-      setQboError(`${inv.clientName}: ${e.message}`);
-    }
-    setQboSendingId("");
-  }
-  async function resubmitInvoice(inv) {
-    await saveApprovalEntry(inv.approvalMonthKey, inv.clientName, {
-      status: "pending",
-      comment: "",
-      approver: inv.approver || "",
+  const [showCloseConfirm, setShowCloseConfirm] = useState(false);
+  const [selectedClosed, setSelectedClosed] = useState("");
+  const [showExport, setShowExport] = useState(false);
+  const [exportOpts, setExportOpts] = useState({ scope: "approved", invoiceDate: "", autoNumber: false, startNo: "" });
+  const [modelUrl, setModelUrl] = useState(DEFAULT_MODEL_URL);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState("");
+  const [showPaste, setShowPaste] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [actualsMsg, setActualsMsg] = useState("");
+  const [actualsError, setActualsError] = useState("");
+  const [leadPaste, setLeadPaste] = useState("");
+  const [showAllMappings, setShowAllMappings] = useState(false);
+
+  // ---------- persistence: every change is re-applied on top of the latest saved data, so concurrent approvals are never overwritten ----------
+  function commit(updater) {
+    const next = updater(dataRef.current);
+    dataRef.current = next;
+    setData(next);
+    pending.current += 1;
+    setSaving(true);
+    saveChain.current = saveChain.current.then(async () => {
+      let merged = dataRef.current;
+      let remoteOk = true;
+      try {
+        const remote = await loadRow(ROW_ID_V2);
+        if (remote && remote.version === 2) merged = updater(normalizeData(remote));
+      } catch {
+        remoteOk = false;
+      }
+      merged = { ...merged, savedAt: new Date().toISOString() };
+      saveLocal(LOCAL_KEY_V2, merged);
+      try {
+        if (!remoteOk) throw new Error("load failed");
+        await saveRow(ROW_ID_V2, merged);
+        setSaveError("");
+      } catch (e) {
+        console.error(e);
+        setSaveError("Saved locally. Supabase save failed.");
+      }
+      pending.current -= 1;
+      if (pending.current === 0) {
+        if (remoteOk) {
+          dataRef.current = merged;
+          setData(merged);
+        }
+        setSaving(false);
+      }
     });
   }
-  async function sendAI() {
-    if (!aiInput.trim() || aiLoading) return;
-    const userMsg = aiInput.trim();
-    setAiInput("");
-    setAiMessages(prev => [...prev, { role: "user", content: userMsg }]);
-    setAiLoading(true);
-    const ctx = `You are a finance assistant for a service business agency.
-CLIENTS: ${JSON.stringify(scopedClients.map(c => ({ name: c.name, lead: c.lead, projectedAmount: c.amount, previousAmount: c.lastAmount, nextAmount: c.nextAmount, hasContract: !!c.contract, contract: c.contract ? { monthlyFee: c.contract.monthlyFee, startDate: c.contract.startDate, endDate: c.contract.endDate } : null })))}
-INVOICES: ${JSON.stringify(billingInvoices.map(i => ({ client: i.clientName, lead: i.lead, amount: i.amount, status: i.status })))}
-PROJECTED MONTH: ${currentMonthLabel}, PREVIOUS MONTH: ${lastMonthLabel}, NEXT MONTH: ${nextMonthLabel}
-TOTAL PROJECTED MONTH: ${fmt(totalProjected)}, TOTAL PREVIOUS MONTH: ${fmt(totalLast)}, TOTAL NEXT MONTH: ${fmt(totalNext)}
-Answer concisely in English. Use USD formatting.`;
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          system: ctx,
-          messages: [{ role: "user", content: userMsg }],
-        }),
-      });
-      const data = await res.json();
-      const reply = data.content?.find(block => block.type === "text")?.text || "Could not process that.";
-      setAiMessages(prev => [...prev, { role: "assistant", content: reply }]);
-    } catch {
-      setAiMessages(prev => [...prev, { role: "assistant", content: "Something went wrong. Please try again." }]);
-    }
-    setAiLoading(false);
+
+  useEffect(() => {
+    (async () => {
+      let d = null;
+      let err = "";
+      try {
+        d = await loadRow(ROW_ID_V2);
+        if (!d) {
+          const v1 = await loadRow(ROW_ID_V1);
+          if (v1) d = migrateV1(v1);
+        }
+      } catch (e) {
+        console.error(e);
+        err = "Could not reach Supabase, showing the local backup.";
+        d = loadLocal(LOCAL_KEY_V2);
+        if (!d) {
+          const v1 = loadLocal(LOCAL_KEY_V1);
+          if (v1) d = migrateV1(v1);
+        }
+      }
+      const norm = normalizeData(d);
+      dataRef.current = norm;
+      setData(norm);
+      setModelUrl(norm.forecast.sheetUrl || DEFAULT_MODEL_URL);
+      setSortMode(norm.clientSort || "az");
+      setSaveError(err);
+      setLoading(false);
+    })();
+  }, []);
+
+  const bm = useMemo(() => buildBillingModel(data), [data]);
+  const M = data.billingMonth;
+  const P = bm.P;
+  const isClosed = (data.closedMonths || []).some(m => m.monthKey === M);
+  const approvalEntry = key => data.approvalHistory?.[M]?.[key] || {};
+
+  const sortRows = list => {
+    const arr = [...list];
+    if (sortMode === "amount") return arr.sort((a, b) => b.amount - a.amount);
+    if (sortMode === "variance") return arr.sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+    if (sortMode === "za") return arr.sort((a, b) => b.name.localeCompare(a.name, "en", { sensitivity: "base" }));
+    return arr.sort((a, b) => a.name.localeCompare(b.name, "en", { sensitivity: "base" }));
+  };
+
+  // ---------- approvals ----------
+  const approvalBase = bm.rows
+    .filter(r => Math.abs(r.amount) > 0.004)
+    .map(r => {
+      const e = approvalEntry(r.key);
+      return {
+        ...r,
+        status: e.status || "pending",
+        comment: e.comment || "",
+        approver: e.approver || r.lead || data.approvers[0] || "",
+        approvedAmount: e.amount,
+        changedSinceApproval: ["approved", "sent"].includes(e.status) && e.amount !== undefined && Math.abs(e.amount - r.amount) > 0.004,
+      };
+    });
+  const approvers = [...new Set([...(data.approvers || []), ...bm.rows.map(r => r.lead).filter(Boolean)])];
+  const approvalLeads = ["all", ...new Set(approvalBase.map(r => r.lead || "No lead"))];
+  const approvalStatuses = ["all", "pending", "approved", "see notes", "rejected", "sent"];
+  const filteredApprovals = sortRows(
+    approvalBase.filter(r => filterLead === "all" || (r.lead || "No lead") === filterLead).filter(r => filterStatus === "all" || r.status === filterStatus)
+  );
+  const pendingCount = approvalBase.filter(r => r.status === "pending").length;
+  const approvedCount = approvalBase.filter(r => r.status === "approved" || r.status === "sent").length;
+  const notApprovedCount = approvalBase.filter(r => !["approved", "sent"].includes(r.status)).length;
+  const canClose = approvalBase.length > 0 && notApprovedCount === 0;
+  const statusByKey = Object.fromEntries(approvalBase.map(r => [r.key, r.status]));
+
+  function saveApproval(key, patch) {
+    commit(d => setIn(d, ["approvalHistory", M, key], { ...(d.approvalHistory?.[M]?.[key] || {}), ...patch, at: new Date().toISOString() }));
   }
-  const tabs = ["dashboard", "clients", "invoices", "invoice approvals", "closed months", "ai assistant"];
-  if (storageLoading) {
+  function decide(decision) {
+    if (!showApprove) return;
+    saveApproval(showApprove.key, { status: decision, comment: approveComment, approver: approveApprover || showApprove.approver || "", amount: showApprove.amount });
+    setShowApprove(null);
+    setApproveComment("");
+  }
+  function openReview(r) {
+    setShowApprove(r);
+    setApproveComment(r.comment || "");
+    setApproveApprover(r.approver || "");
+  }
+  function resetApprovals() {
+    commit(d => setIn(d, ["approvalHistory", M], undefined));
+  }
+  function closeMonth() {
+    if (!canClose) return;
+    const record = {
+      monthKey: M,
+      monthLabel: ymLabel(M),
+      previousMonthKey: P,
+      previousMonthLabel: ymLabel(P),
+      closedAt: new Date().toISOString(),
+      total: round2(approvalBase.reduce((s, r) => s + r.amount, 0)),
+      invoiceCount: approvalBase.length,
+      approvedCount: approvalBase.filter(r => r.status === "approved").length,
+      sentCount: approvalBase.filter(r => r.status === "sent").length,
+      invoices: approvalBase.map(r => ({
+        id: `${M}-${r.key}`,
+        clientName: r.name,
+        lead: r.lead,
+        approver: r.approver,
+        status: r.status,
+        comment: r.comment,
+        amount: r.amount,
+        lastAmount: r.prevAmount,
+        lines: r.lines.filter(l => !l.removed && l.amount).map(l => ({ service: l.service, department: l.department, amount: l.amount })),
+      })),
+    };
+    const next = ymAdd(M, 1);
+    commit(d => ({ ...d, closedMonths: [...(d.closedMonths || []).filter(m => m.monthKey !== M), record], billingMonth: next }));
+    setSelectedClosed(M);
+    setShowCloseConfirm(false);
+  }
+
+  // ---------- billing edits ----------
+  function setLineAmount(line, value) {
+    if (line.manual) {
+      commit(d => setIn(d, ["manualLines", M], (d.manualLines?.[M] || []).map(l => (l.id === line.id ? { ...l, amount: value } : l))));
+    } else if (Math.abs(value - (line.modelAmount || 0)) < 0.005) {
+      commit(d => setIn(d, ["overrides", M, line.id], undefined));
+    } else {
+      commit(d => setIn(d, ["overrides", M, line.id], { amount: value, at: new Date().toISOString() }));
+    }
+  }
+  function removeLine(line) {
+    if (line.manual) commit(d => setIn(d, ["manualLines", M], (d.manualLines?.[M] || []).filter(l => l.id !== line.id)));
+    else commit(d => setIn(d, ["overrides", M, line.id], { removed: true, at: new Date().toISOString() }));
+  }
+  function restoreLine(line) {
+    commit(d => setIn(d, ["overrides", M, line.id], undefined));
+  }
+  function removeClient(client) {
+    commit(d => {
+      let next = d;
+      client.lines.forEach(line => {
+        if (line.manual) next = setIn(next, ["manualLines", M], (next.manualLines?.[M] || []).filter(l => l.id !== line.id));
+        else next = setIn(next, ["overrides", M, line.id], { removed: true, at: new Date().toISOString() });
+      });
+      return next;
+    });
+  }
+  function addLine() {
+    const amount = parseAmount(newLine.amount);
+    if (!newLine.clientName.trim() || amount === null) return;
+    const known = Object.values(bm.modelNames).find(n => clientKey(n) === clientKey(newLine.clientName));
+    const line = {
+      id: `manual|${makeLineId(newLine.clientName, newLine.service, newLine.department)}|${Date.now()}`,
+      clientName: known || newLine.clientName.trim(),
+      service: newLine.service.trim(),
+      department: newLine.department.trim(),
+      lead: "",
+      amount: round2(amount),
+    };
+    commit(d => setIn(d, ["manualLines", M], [...(d.manualLines?.[M] || []), line]));
+    setExpanded(prev => ({ ...prev, [clientKey(line.clientName)]: true }));
+    setShowAddLine(false);
+    setNewLine({ clientName: "", service: "", department: "", amount: "" });
+  }
+  function setLead(key, lead) {
+    commit(d => ({
+      ...setIn(d, ["leadOverrides", key], lead || undefined),
+      approvers: lead && !(d.approvers || []).includes(lead) ? [...(d.approvers || []), lead] : d.approvers || [],
+    }));
+  }
+  function setBillingMonth(ym) {
+    setFilterLead("all");
+    setFilterStatus("all");
+    setExpanded({});
+    commit(d => ({ ...d, billingMonth: ym }));
+  }
+
+  // ---------- data sources ----------
+  function applyModel(result, source) {
+    const syncedAt = new Date().toISOString();
+    commit(d => ({ ...d, forecast: { lines: result.lines, totals: result.totals, syncedAt, source, sheetUrl: modelUrl } }));
+    setNotice(`Financial model synced: ${result.lines.length} revenue lines across ${new Set(result.lines.map(l => clientKey(l.clientName))).size} clients.`);
+  }
+  async function syncModel() {
+    setSyncing(true);
+    setSyncError("");
+    try {
+      const url = modelCsvUrl(modelUrl);
+      let res;
+      try {
+        res = await fetch(url);
+      } catch {
+        throw new Error("The browser could not reach Google Sheets. The sheet is probably restricted: share it as Anyone with the link can view, or use Upload file or Paste below.");
+      }
+      if (!res.ok) throw new Error(`Google Sheets returned ${res.status}. Check the link and sharing settings, or use Upload file or Paste below.`);
+      const text = await res.text();
+      if (/^\s*</.test(text)) throw new Error("Google returned a sign in page instead of data. Share the sheet as Anyone with the link can view, or use Upload file or Paste below.");
+      applyModel(parseModelRows(parseCsv(text)), "Google Sheets (live sync)");
+    } catch (e) {
+      setSyncError(e.message);
+    }
+    setSyncing(false);
+  }
+  async function uploadModelFile(file) {
+    if (!file) return;
+    setSyncError("");
+    try {
+      const { rows, sheetName } = await readSpreadsheetFile(file, /forecasted revenue/i);
+      applyModel(parseModelRows(rows.map(r => r.map(c => (c instanceof Date ? c : typeof c === "number" ? c : String(c))))), `File upload: ${file.name} (${sheetName})`);
+    } catch (e) {
+      setSyncError(e.message);
+    }
+  }
+  function applyPaste() {
+    setSyncError("");
+    try {
+      applyModel(parseModelRows(parseTsv(pasteText)), "Pasted from the Forecasted Revenue tab");
+      setPasteText("");
+      setShowPaste(false);
+    } catch (e) {
+      setSyncError(e.message);
+    }
+  }
+  async function uploadActuals(file) {
+    if (!file) return;
+    setActualsError("");
+    setActualsMsg("");
+    try {
+      const { rows } = await readSpreadsheetFile(file);
+      const parsed = parseQboRows(rows);
+      const months = [...new Set(parsed.lines.map(l => l.ym))].sort();
+      const total = round2(parsed.lines.reduce((s, l) => s + l.amount, 0));
+      const upload = { fileName: file.name, uploadedAt: new Date().toISOString(), mode: parsed.mode, months, lineCount: parsed.lines.length, total };
+      commit(d => ({
+        ...d,
+        actuals: {
+          lines: [...(d.actuals.lines || []).filter(l => !months.includes(l.ym)), ...parsed.lines],
+          uploads: [...(d.actuals.uploads || []), upload].slice(-20),
+        },
+      }));
+      setActualsMsg(`${file.name}: ${parsed.lines.length} lines, ${fmt(total)}, ${ymLabel(months[0])} to ${ymLabel(months[months.length - 1])}. Months in this file replace any earlier upload for the same months.${parsed.mode === "summary" ? " This is a summary report, so the QBO import file cannot copy items, classes or descriptions from it." : ""}`);
+    } catch (e) {
+      setActualsError(e.message);
+    }
+  }
+  function clearActuals() {
+    commit(d => ({ ...d, actuals: { lines: [], uploads: [] } }));
+    setActualsMsg("QBO actuals cleared.");
+  }
+  function setMapping(qboName, value) {
+    commit(d => setIn(d, ["customerMap", qboName], value || undefined));
+  }
+  function importLeads() {
+    const rows = parseTsv(leadPaste).filter(r => r.some(c => c.trim()));
+    if (!rows.length) return;
+    const header = rows[0].map(c => c.trim().toLowerCase());
+    const hasHeader = header.includes("lead") || header.includes("client");
+    const ci = hasHeader ? Math.max(0, header.indexOf("client")) : 0;
+    const li = hasHeader ? (header.indexOf("lead") >= 0 ? header.indexOf("lead") : 1) : 1;
+    const pairs = (hasHeader ? rows.slice(1) : rows).map(r => [String(r[ci] || "").trim(), String(r[li] || "").trim()]).filter(([c, l]) => c && l);
+    commit(d => {
+      let next = d;
+      pairs.forEach(([c, l]) => {
+        next = setIn(next, ["leadOverrides", clientKey(c)], l);
+      });
+      return { ...next, approvers: [...new Set([...(next.approvers || []), ...pairs.map(p => p[1])])] };
+    });
+    setLeadPaste("");
+    setNotice(`${pairs.length} client leads updated.`);
+  }
+
+  // ---------- export ----------
+  const exportData = useMemo(() => (showExport ? buildExport(data, bm, exportOpts) : null), [showExport, data, bm, exportOpts]);
+  function openExport() {
+    const P0 = bm.P;
+    const prevDates = (data.actuals.lines || []).filter(l => l.ym === P0 && l.date && /invoice/i.test(l.type || "invoice")).map(l => Number(l.date.slice(8, 10)));
+    let day = 1;
+    if (prevDates.length) {
+      const counts = {};
+      prevDates.forEach(x => (counts[x] = (counts[x] || 0) + 1));
+      day = Number(Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0]);
+    }
+    const { y, m0 } = ymSplit(M);
+    const date = new Date(y, m0, Math.min(day, daysInYm(M)));
+    const maxNum = (data.actuals.lines || []).reduce((mx, l) => (/^\d+$/.test(l.num) ? Math.max(mx, Number(l.num)) : mx), 0);
+    setExportOpts({ scope: "approved", invoiceDate: isoDate(date), autoNumber: !!data.exportSettings?.autoNumber || !maxNum, startNo: maxNum ? String(maxNum + 1) : "" });
+    setShowExport(true);
+  }
+  function saveLineField(lineId, field, value) {
+    commit(d => {
+      const cur = d.invoiceFieldMemory?.[lineId] || {};
+      const patch = field === "description" ? { description: value, descriptionYm: M } : { [field]: value };
+      return setIn(d, ["invoiceFieldMemory", lineId], { ...cur, ...patch });
+    });
+  }
+  function saveCustomerField(key, field, value) {
+    commit(d => setIn(d, ["invoiceFieldMemory", `customer|${key}`], { ...(d.invoiceFieldMemory?.[`customer|${key}`] || {}), [field]: value }));
+  }
+  function markExportedAsSent() {
+    if (!exportData) return;
+    const stamp = new Date().toLocaleDateString("en-US");
+    commit(d => {
+      let next = d;
+      exportData.invoices.forEach(inv => {
+        const cur = next.approvalHistory?.[M]?.[inv.key] || {};
+        next = setIn(next, ["approvalHistory", M, inv.key], { ...cur, status: "sent", comment: cur.comment || `Included in QBO import file ${stamp}${inv.no ? `, invoice ${inv.no}` : ""}`, amount: inv.total, at: new Date().toISOString() });
+      });
+      return { ...next, exportSettings: { ...next.exportSettings, autoNumber: exportOpts.autoNumber } };
+    });
+    setShowExport(false);
+    setNotice(`${exportData.invoices.length} invoices marked as exported.`);
+  }
+
+  const closedRecords = data.closedMonths || [];
+  const closedSelected = closedRecords.find(m => m.monthKey === selectedClosed) || closedRecords[closedRecords.length - 1] || null;
+  const hasForecast = (data.forecast.lines || []).length > 0;
+  const unmatchedCustomers = bm.qboCustomers.filter(c => !c.matched && !data.customerMap?.[c.name]);
+  const mappedCustomers = bm.qboCustomers.filter(c => data.customerMap?.[c.name]);
+  const modelClientOptions = Object.entries(bm.modelNames).sort((a, b) => a[1].localeCompare(b[1], "en", { sensitivity: "base" }));
+  const tabs = [
+    ["billing", "Billing"],
+    ["approvals", "Approvals"],
+    ["closed", "Closed Months"],
+    ["data", "Data Sources"],
+  ];
+
+  if (loading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
         <p className="text-gray-400 text-sm">Loading data...</p>
       </div>
     );
   }
+
+  const prevLabel = `${ymLabel(P)} ${bm.prevSource === "actuals" ? "actual" : "forecast"}`;
+  const totalDiff = round2(bm.total - bm.prevTotal);
+
   return (
     <div className="min-h-screen bg-gray-50 font-sans">
       <div className="bg-white border-b border-gray-100 px-6 py-4 flex items-center justify-between gap-3 flex-wrap">
         <div>
           <h1 className="text-xl font-semibold text-gray-900">InvoiceFlow</h1>
-          <p className="text-xs text-gray-400">Service Business Dashboard</p>
+          <p className="text-xs text-gray-400">Fiat Growth monthly billing</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {saving && <span className="text-xs text-gray-400">Saving...</span>}
           {saveError && <span className="text-xs font-medium text-red-500">{saveError}</span>}
-          {monthCols.length > 0 && (
-            <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-1.5">
-              <span className="text-xs text-gray-400">Billing month:</span>
-              <select
-                value={billingContext.curKey}
-                onChange={async e => {
-                  const newKey = e.target.value;
-                  setCurColKey(newKey);
-                  if (!approvalMonthKey) setApprovalMonthKey(newKey);
-                  await persistSnapshot({ curColKey: newKey, approvalMonthKey: approvalMonthKey || newKey });
-                }}
-                className="text-xs font-medium text-gray-700 outline-none bg-transparent"
-              >
-                {monthCols.map(col => (
-                  <option key={col.h} value={col.h}>
-                    {formatMonthLabel(col.d)}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
           <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-1.5">
-            <span className="text-xs text-gray-400">Sort clients:</span>
-            <select
-              value={clientSort}
-              onChange={async e => {
-                const newSort = e.target.value;
-                setClientSort(newSort);
-                await persistSnapshot({ clientSort: newSort });
-              }}
-              className="text-xs font-medium text-gray-700 outline-none bg-transparent"
-            >
-              <option value="sheet">Sheet order</option>
-              <option value="az">A to Z</option>
-              <option value="za">Z to A</option>
+            <span className="text-xs text-gray-400">Billing month:</span>
+            <select value={M} onChange={e => setBillingMonth(e.target.value)} className="text-xs font-medium text-gray-700 outline-none bg-transparent">
+              {bm.monthOptions.map(ym => (
+                <option key={ym} value={ym}>
+                  {ymLabel(ym)}
+                  {closedRecords.some(c => c.monthKey === ym) ? " (closed)" : ""}
+                </option>
+              ))}
             </select>
           </div>
           <button
-            onClick={() => {
-              setShowContract(true);
-              setContractStep("upload");
-              setContractError("");
-              setContractResult(null);
-              setContractFile(null);
-            }}
-            className="px-4 py-2 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+            onClick={openExport}
+            disabled={!bm.rows.some(r => r.amount)}
+            className="px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 transition-colors disabled:opacity-40"
           >
-            Upload Contract
-          </button>
-          {approvedCount > 0 && (
-            <button
-              onClick={() => {
-                const approved = approvalInvoices.filter(inv => inv.status === "approved");
-                const rows = [["Client", "Lead", "Department", "Service", "Month", "Amount"]];
-                approved.forEach(inv => {
-                  const lines = inv.lines?.filter(line => (line.amounts[inv.monthCol] || 0) > 0) || [];
-                  if (!lines.length) rows.push([inv.clientName, inv.lead, "", "", inv.month, inv.amount]);
-                  else lines.forEach(line => rows.push([inv.clientName, inv.lead, line.department, line.service, inv.month, line.amounts[inv.monthCol]]));
-                });
-                const csv = rows.map(row => row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(",")).join("\n");
-                const a = document.createElement("a");
-                a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-                a.download = `approved-${(approvalContext.curLabel || "approvals").replace(" ", "-")}.csv`;
-                a.click();
-              }}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-emerald-600 text-white hover:bg-emerald-700 transition-colors"
-            >
-              Export Approved CSV
-            </button>
-          )}
-          <button
-            onClick={() => {
-              setShowImport(true);
-              setImportStep("clients");
-              setImportError("");
-            }}
-            className={`px-4 py-2 rounded-lg text-sm font-medium border transition-all ${
-              connected ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-gray-900 bg-gray-900 text-white hover:bg-gray-700"
-            }`}
-          >
-            {connected ? `Synced: ${clients.length} clients — Re-import` : "Import from Sheet"}
-          </button>
-          {qboError && <span className="text-xs font-medium text-red-500 max-w-xs truncate" title={qboError}>{qboError}</span>}
-          <button
-            onClick={qboConnected || qboSyncing ? undefined : connectQBO}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-              qboConnected ? "bg-emerald-50 text-emerald-700 cursor-default border border-emerald-200" : "bg-white border border-gray-200 text-gray-600 hover:bg-gray-50"
-            }`}
-            title={qboCompany ? `Connected to ${qboCompany}` : "Verifies the connection through your QuickBooks connector in claude.ai"}
-          >
-            {qboSyncing ? "Connecting..." : qboConnected ? `QBO Connected${qboCompany ? ` — ${qboCompany}` : ""}` : "Connect QuickBooks"}
+            Export for QBO
           </button>
         </div>
       </div>
       <div className="bg-white border-b border-gray-100 px-6 overflow-x-auto">
         <div className="flex gap-6 min-w-max">
-          {tabs.map(t => (
+          {tabs.map(([id, label]) => (
             <button
-              key={t}
-              onClick={() => setTab(t)}
-              className={`py-3 text-sm font-medium border-b-2 transition-colors capitalize whitespace-nowrap ${
-                tab === t ? "border-gray-900 text-gray-900" : "border-transparent text-gray-400 hover:text-gray-600"
-              }`}
+              key={id}
+              onClick={() => setTab(id)}
+              className={`py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${tab === id ? "border-gray-900 text-gray-900" : "border-transparent text-gray-400 hover:text-gray-600"}`}
             >
-              {t === "invoice approvals" && pendingCount > 0 ? (
-                <span className="flex items-center gap-1.5">
-                  Invoice Approvals
-                  <span className="bg-amber-100 text-amber-700 text-xs px-1.5 py-0.5 rounded-full">{pendingCount}</span>
-                </span>
-              ) : (
-                t.charAt(0).toUpperCase() + t.slice(1)
-              )}
+              <span className="flex items-center gap-1.5">
+                {label}
+                {id === "approvals" && pendingCount > 0 && <span className="bg-amber-100 text-amber-700 text-xs px-1.5 py-0.5 rounded-full">{pendingCount}</span>}
+                {id === "data" && unmatchedCustomers.length > 0 && <span className="bg-amber-100 text-amber-700 text-xs px-1.5 py-0.5 rounded-full">{unmatchedCustomers.length}</span>}
+              </span>
             </button>
           ))}
         </div>
       </div>
-      {!connected && (
-        <div className="max-w-6xl mx-auto px-6 pt-6">
-          <div className="bg-blue-50 border border-blue-100 rounded-2xl px-6 py-4 text-sm text-blue-700 flex items-center justify-between">
-            <span>Import your data from Google Sheets to get started.</span>
-            <button onClick={() => setShowImport(true)} className="ml-4 bg-blue-700 text-white px-4 py-1.5 rounded-lg text-xs hover:bg-blue-800">
-              Import now
+
+      <div className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+        {notice && (
+          <div className="bg-emerald-50 border border-emerald-100 rounded-xl px-4 py-2 text-xs text-emerald-700 flex items-center justify-between gap-3">
+            <span>{notice}</span>
+            <button onClick={() => setNotice("")} className="text-emerald-500 hover:text-emerald-700">
+              ×
             </button>
           </div>
-        </div>
-      )}
-      <div className="max-w-6xl mx-auto px-6 py-8">
-        {tab === "dashboard" && (
-          <div className="space-y-6">
-            <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-              {[
-                { label: `Projected — ${currentMonthLabel || "selected month"}`, value: fmt(totalProjected), sub: `${activeClients.length} active clients` },
-                { label: `Previous — ${lastMonthLabel || "previous month"}`, value: fmt(totalLast), sub: "actual previous month" },
-                {
-                  label: "Month-over-Month",
-                  value: (totalProjected - totalLast >= 0 ? "+" : "") + fmt(totalProjected - totalLast),
-                  sub: totalProjected >= totalLast ? "increase" : "decrease",
-                  color: totalProjected >= totalLast ? "text-emerald-600" : "text-red-500",
-                },
-                { label: "Pending Approval", value: pendingCount, sub: `${approvedCount} approved` },
-              ].map(card => (
-                <div key={card.label} className="bg-white rounded-2xl p-5 border border-gray-100">
-                  <p className="text-xs text-gray-400 mb-1">{card.label}</p>
-                  <p className={`text-2xl font-semibold ${card.color || "text-gray-900"}`}>{card.value}</p>
-                  <p className="text-xs text-gray-400 mt-1">{card.sub}</p>
-                </div>
-              ))}
-            </div>
-            <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-              <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
-                <h2 className="font-medium text-gray-800">Month Comparison by Client</h2>
-                <span className="text-xs text-gray-400">
-                  {currentMonthLabel} vs {lastMonthLabel || "previous month"}
-                </span>
+        )}
+        {!hasForecast && (
+          <div className="bg-blue-50 border border-blue-100 rounded-2xl px-6 py-4 text-sm text-blue-700 flex items-center justify-between gap-3">
+            <span>Sync the financial model and upload the QBO actuals to get started.</span>
+            <button onClick={() => setTab("data")} className="bg-blue-700 text-white px-4 py-1.5 rounded-lg text-xs hover:bg-blue-800">
+              Go to Data Sources
+            </button>
+          </div>
+        )}
+
+        {/* ---------------- BILLING ---------------- */}
+        {tab === "billing" && (
+          <>
+            {bm.prevSource === "forecast" && hasForecast && (
+              <div className="bg-amber-50 border border-amber-100 rounded-xl px-4 py-2 text-xs text-amber-700">
+                No QBO actuals loaded for {ymLabel(P)}, so the comparison uses the financial model forecast for that month. Upload the QBO export in Data Sources to compare against what was actually billed.
               </div>
-              {scopedClients.length === 0 ? (
-                <div className="px-6 py-10 text-center text-gray-300 text-sm">Import your data to see the comparison</div>
+            )}
+            <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+              <StatCard label={`${ymLabel(M)} billing (forecast)`} value={fmt(bm.total)} sub={`${bm.rows.filter(r => r.amount).length} clients`} />
+              <StatCard label={prevLabel} value={fmt(bm.prevTotal)} sub={`${bm.rows.filter(r => r.prevAmount).length} clients`} />
+              <StatCard label="Variance" value={fmtSigned(totalDiff)} sub={fmtPct(bm.total, bm.prevTotal)} color={varColor(totalDiff)} />
+              <StatCard label="Approvals" value={`${approvedCount} / ${approvalBase.length}`} sub={pendingCount ? `${pendingCount} pending` : "nothing pending"} />
+            </div>
+
+            <Card
+              title={`${ymLabel(M)} vs ${ymLabel(P)} by client`}
+              subtitle={isClosed ? "This month is closed, amounts are locked." : "Expand a client to edit or remove forecast lines for this month. Changes apply to this dashboard only, never to the financial model."}
+              right={
+                <div className="flex items-center gap-2">
+                  <select value={sortMode} onChange={e => setSortMode(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs outline-none text-gray-600 bg-white">
+                    <option value="az">Client A to Z</option>
+                    <option value="za">Client Z to A</option>
+                    <option value="amount">Billing amount</option>
+                    <option value="variance">Largest variance</option>
+                  </select>
+                  {!isClosed && (
+                    <button onClick={() => setShowAddLine(true)} className="bg-gray-900 text-white text-xs px-3 py-1.5 rounded-lg hover:bg-gray-700">
+                      + Add line
+                    </button>
+                  )}
+                </div>
+              }
+            >
+              {bm.rows.length === 0 ? (
+                <div className="px-6 py-10 text-center text-gray-300 text-sm">No billing for {ymLabel(M)} or {ymLabel(P)}.</div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-xs text-gray-400 border-b border-gray-50">
+                        <th className="px-6 py-3 text-left">Client</th>
+                        <th className="px-4 py-3 text-left">Lead</th>
+                        <th className="px-4 py-3 text-right">{prevLabel}</th>
+                        <th className="px-4 py-3 text-right">{ymLabel(M)}</th>
+                        <th className="px-4 py-3 text-right">Variance</th>
+                        <th className="px-4 py-3 text-right">%</th>
+                        <th className="px-4 py-3 text-left">Approval</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortRows(bm.rows).map(r => {
+                        const open = !!expanded[r.key];
+                        const edits = r.lines.filter(l => l.edited || l.removed || l.manual).length;
+                        return [
+                          <tr key={r.key} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                            <td className="px-6 py-3">
+                              <button onClick={() => setExpanded(prev => ({ ...prev, [r.key]: !open }))} className="text-left">
+                                <span className="text-gray-300 mr-2 text-xs">{open ? "▾" : "▸"}</span>
+                                <span className="font-medium text-gray-800">{r.name}</span>
+                              </button>
+                              {edits > 0 && <span className="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">{edits} edited</span>}
+                            </td>
+                            <td className="px-4 py-3 text-xs">
+                              <EditableText value={r.lead} onSave={v => setLead(r.key, v)} placeholder="Add lead" />
+                            </td>
+                            <td className="px-4 py-3 text-right text-gray-500">{fmt(r.prevAmount)}</td>
+                            <td className="px-4 py-3 text-right font-medium text-gray-800">{fmt(r.amount)}</td>
+                            <td className={`px-4 py-3 text-right font-medium ${varColor(r.diff)}`}>{fmtSigned(r.diff)}</td>
+                            <td className={`px-4 py-3 text-right text-xs ${varColor(r.diff)}`}>{fmtPct(r.amount, r.prevAmount)}</td>
+                            <td className="px-4 py-3">{r.amount ? <Badge status={statusByKey[r.key] || "pending"} /> : <span className="text-xs text-gray-300">n/a</span>}</td>
+                          </tr>,
+                          open && (
+                            <tr key={`${r.key}-lines`} className="bg-gray-50 border-b border-gray-100">
+                              <td colSpan={7} className="px-6 py-3">
+                                {r.lines.length === 0 ? (
+                                  <p className="text-xs text-gray-400">No forecast lines for {ymLabel(M)}.</p>
+                                ) : (
+                                  <table className="w-full text-xs">
+                                    <thead>
+                                      <tr className="text-gray-400">
+                                        <th className="py-1 text-left font-normal">Service</th>
+                                        <th className="py-1 text-left font-normal">Department</th>
+                                        <th className="py-1 text-right font-normal">Model</th>
+                                        <th className="py-1 text-right font-normal">Billing</th>
+                                        <th className="py-1 text-left font-normal pl-4">Status</th>
+                                        <th className="py-1"></th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {r.lines.map(l => (
+                                        <tr key={l.id} className="border-t border-gray-100">
+                                          <td className={`py-1.5 ${l.removed ? "text-gray-300 line-through" : "text-gray-700"}`}>{l.service || "n/a"}</td>
+                                          <td className="py-1.5 text-gray-500">{l.department || "n/a"}</td>
+                                          <td className="py-1.5 text-right text-gray-400">{l.manual ? "n/a" : fmt(l.modelAmount)}</td>
+                                          <td className="py-1.5 text-right">
+                                            {l.removed ? <span className="text-gray-300">{fmt(0)}</span> : <EditableAmount value={l.amount} disabled={isClosed} onSave={v => setLineAmount(l, v)} />}
+                                          </td>
+                                          <td className="py-1.5 pl-4">{l.removed ? <Badge status="removed" /> : l.manual ? <Badge status="added" /> : l.edited ? <Badge status="edited" /> : <span className="text-gray-300">Model</span>}</td>
+                                          <td className="py-1.5 text-right whitespace-nowrap">
+                                            {!isClosed && (l.removed || l.edited) && (
+                                              <button onClick={() => restoreLine(l)} className="text-blue-500 hover:underline mr-3">
+                                                Reset to model
+                                              </button>
+                                            )}
+                                            {!isClosed && !l.removed && (
+                                              <button onClick={() => removeLine(l)} className="text-gray-400 hover:text-red-500">
+                                                Remove
+                                              </button>
+                                            )}
+                                          </td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                )}
+                                {!isClosed && r.lines.some(l => !l.removed) && (
+                                  <div className="mt-2 flex gap-3">
+                                    <button onClick={() => removeClient(r)} className="text-xs text-red-500 hover:underline">
+                                      Remove {r.name} from {ymLabel(M)}
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        setNewLine({ clientName: r.name, service: "", department: r.departments[0] || "", amount: "" });
+                                        setShowAddLine(true);
+                                      }}
+                                      className="text-xs text-blue-500 hover:underline"
+                                    >
+                                      + Add line for this client
+                                    </button>
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          ),
+                        ];
+                      })}
+                    </tbody>
+                    <tfoot>
+                      <tr className="text-sm font-semibold text-gray-800">
+                        <td className="px-6 py-3" colSpan={2}>
+                          Total
+                        </td>
+                        <td className="px-4 py-3 text-right">{fmt(bm.prevTotal)}</td>
+                        <td className="px-4 py-3 text-right">{fmt(bm.total)}</td>
+                        <td className={`px-4 py-3 text-right ${varColor(totalDiff)}`}>{fmtSigned(totalDiff)}</td>
+                        <td className={`px-4 py-3 text-right text-xs ${varColor(totalDiff)}`}>{fmtPct(bm.total, bm.prevTotal)}</td>
+                        <td></td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              )}
+            </Card>
+
+            <Card
+              tone="red"
+              title={`No billing in ${ymLabel(M)}`}
+              subtitle={`Clients billed in ${ymLabel(P)} with nothing forecast for ${ymLabel(M)}`}
+              right={<span className="text-xs text-red-500">{bm.lost.length} clients, {fmt(bm.lost.reduce((s, r) => s + r.prevAmount, 0))}</span>}
+            >
+              {bm.lost.length === 0 ? (
+                <div className="px-6 py-6 text-center text-gray-300 text-sm">Every client billed in {ymLabel(P)} has billing in {ymLabel(M)}.</div>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-xs text-gray-400 border-b border-gray-50">
                       <th className="px-6 py-3 text-left">Client</th>
-                      <th className="px-6 py-3 text-left">Lead</th>
-                      <th className="px-6 py-3 text-left">Departments</th>
-                      <th className="px-6 py-3 text-right">{lastMonthLabel || "Previous"}</th>
-                      <th className="px-6 py-3 text-right">{currentMonthLabel || "Projected"}</th>
-                      <th className="px-6 py-3 text-right">Change</th>
-                      <th className="px-6 py-3 text-left">Invoice</th>
+                      <th className="px-4 py-3 text-left">Lead</th>
+                      <th className="px-4 py-3 text-right">{prevLabel}</th>
+                      <th className="px-4 py-3 text-right">{ymLabel(M)}</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {activeClients
-                      .filter(client => client.amount > 0 || client.lastAmount > 0)
-                      .map(client => {
-                        const diff = client.amount - client.lastAmount;
-                        const inv = billingInvoices.find(invoice => invoice.clientId === client.id);
-                        const depts = [...new Set(client.lines.map(line => line.department))].filter(Boolean);
-                        return (
-                          <tr key={client.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
-                            <td className="px-6 py-3 font-medium text-gray-800">
-                              {client.name}
-                              {client.contract && <span className="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">contract</span>}
-                            </td>
-                            <td className="px-6 py-3 text-xs">
-                              <EditableTextCell value={client.lead} onSave={value => updateLead(client.id, value)} placeholder="Lead name" />
-                            </td>
-                            <td className="px-6 py-3">
-                              <div className="flex flex-wrap gap-1">
-                                {depts.map(dept => (
-                                  <span key={dept} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">
-                                    {dept}
-                                  </span>
-                                ))}
-                              </div>
-                            </td>
-                            <td className="px-6 py-3 text-right text-gray-500">{fmt(client.lastAmount)}</td>
-                            <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(client.amount)}</td>
-                            <td className={`px-6 py-3 text-right font-medium ${diff >= 0 ? "text-emerald-600" : "text-red-500"}`}>
-                              {diff >= 0 ? "+" : ""}
-                              {fmt(diff)}
-                            </td>
-                            <td className="px-6 py-3">{inv && <Badge status={inv.status} />}</td>
-                          </tr>
-                        );
-                      })}
-                  </tbody>
-                </table>
-              )}
-            </div>
-            <NewProjectedClients clients={activeClients} currentMonthLabel={currentMonthLabel} lastMonthLabel={lastMonthLabel} />
-          </div>
-        )}
-        {tab === "clients" && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <h2 className="font-medium text-gray-800">Clients ({activeClients.length} active · {rawRows.length} service lines)</h2>
-              <div className="flex gap-2 items-center">
-                {monthCols.length > 0 && (
-                  <select
-                    value={billingContext.curKey}
-                    onChange={async e => {
-                      const newKey = e.target.value;
-                      setCurColKey(newKey);
-                      await persistSnapshot({ curColKey: newKey });
-                    }}
-                    className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600"
-                  >
-                    {monthCols.map(col => (
-                      <option key={col.h} value={col.h}>
-                        {formatMonthLabel(col.d)}
-                      </option>
+                    {sortRows(bm.lost).map(r => (
+                      <tr key={r.key} className="border-b border-gray-50 hover:bg-red-50 transition-colors">
+                        <td className="px-6 py-3 font-medium text-gray-800">{r.name}</td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{r.lead || "n/a"}</td>
+                        <td className="px-4 py-3 text-right text-gray-700">{fmt(r.prevAmount)}</td>
+                        <td className="px-4 py-3 text-right text-gray-400">{fmt(0)}</td>
+                      </tr>
                     ))}
-                  </select>
-                )}
-                <select
-                  value={clientSort}
-                  onChange={async e => {
-                    const newSort = e.target.value;
-                    setClientSort(newSort);
-                    await persistSnapshot({ clientSort: newSort });
-                  }}
-                  className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600"
-                >
-                  <option value="sheet">Sheet order</option>
-                  <option value="az">A to Z</option>
-                  <option value="za">Z to A</option>
-                </select>
-                <button
-                  onClick={() => {
-                    setShowContract(true);
-                    setContractStep("upload");
-                    setContractError("");
-                    setContractResult(null);
-                    setContractFile(null);
-                  }}
-                  className="bg-blue-600 text-white text-sm px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors"
-                >
-                  Upload Contract
-                </button>
-                <button onClick={() => setShowAddClient(true)} className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700 transition-colors">
-                  + Add Client
-                </button>
-              </div>
-            </div>
-            <div className="bg-blue-50 border border-blue-100 rounded-xl px-4 py-2 text-xs text-blue-600">
-              Click any amount in the Current or Next Month columns, or any name in the Lead column, to edit it inline. Changes are saved automatically and manually edited leads are preserved on re-import. Use the sort selector to list clients alphabetically. You can also upload a contract PDF and the fixed fee will be loaded for every month in its term.
-            </div>
-            <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-              {scopedClients.length === 0 ? (
-                <div className="px-6 py-10 text-center text-gray-300 text-sm">No clients — import your data or upload a contract</div>
+                  </tbody>
+                </table>
+              )}
+            </Card>
+
+            <Card
+              tone="green"
+              title={`New in ${ymLabel(M)}`}
+              subtitle={`Clients with billing in ${ymLabel(M)} and nothing in ${ymLabel(P)}`}
+              right={<span className="text-xs text-emerald-600">{bm.added.length} clients, {fmt(bm.added.reduce((s, r) => s + r.amount, 0))}</span>}
+            >
+              {bm.added.length === 0 ? (
+                <div className="px-6 py-6 text-center text-gray-300 text-sm">No new clients this month.</div>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-xs text-gray-400 border-b border-gray-50">
-                      <th className="px-6 py-3 text-left">
-                        <button
-                          onClick={async () => {
-                            const newSort = clientSort === "az" ? "za" : "az";
-                            setClientSort(newSort);
-                            await persistSnapshot({ clientSort: newSort });
-                          }}
-                          className="hover:text-gray-600 transition-colors"
-                          title="Sort alphabetically"
-                        >
-                          Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
-                        </button>
-                      </th>
-                      <th className="px-6 py-3 text-left">Lead</th>
-                      <th className="px-6 py-3 text-left">Services</th>
-                      <th className="px-6 py-3 text-left">Departments</th>
-                      <th className="px-6 py-3 text-left">Contract</th>
-                      <th className="px-6 py-3 text-right">{currentMonthLabel || "Current"}</th>
-                      <th className="px-6 py-3 text-right">{nextMonthLabel || "Next"}</th>
-                      <th className="px-6 py-3 text-left">QBO Lines</th>
-                      <th className="px-6 py-3 text-left">Status</th>
+                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-4 py-3 text-left">Lead</th>
+                      <th className="px-4 py-3 text-left">Services</th>
+                      <th className="px-4 py-3 text-right">{prevLabel}</th>
+                      <th className="px-4 py-3 text-right">{ymLabel(M)}</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {scopedClients.map(client => {
-                      const services = [...new Set(client.lines.map(line => line.service))].filter(Boolean);
-                      const depts = [...new Set(client.lines.map(line => line.department))].filter(Boolean);
-                      return (
-                        <tr key={client.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
-                          <td className="px-6 py-3 font-medium text-gray-800">{client.name}</td>
-                          <td className="px-6 py-3 text-xs">
-                            <EditableTextCell value={client.lead} onSave={value => updateLead(client.id, value)} placeholder="Lead name" />
-                          </td>
-                          <td className="px-6 py-3 text-gray-500 text-xs">{services.join(", ")}</td>
-                          <td className="px-6 py-3">
-                            <div className="flex flex-wrap gap-1">
-                              {depts.map(dept => (
-                                <span key={dept} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">
-                                  {dept}
-                                </span>
-                              ))}
-                            </div>
-                          </td>
-                          <td className="px-6 py-3 text-xs">
-                            {client.contract ? (
-                              <span
-                                className="bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full cursor-help"
-                                title={`${client.contract.fileName} · ${fmt(client.contract.monthlyFee)}/mo${client.contract.startDate ? ` · ${client.contract.startDate}` : ""}${client.contract.endDate ? ` to ${client.contract.endDate}` : ""}${client.contract.notes ? ` · ${client.contract.notes}` : ""}`}
-                              >
-                                {fmt(client.contract.monthlyFee)}/mo
-                              </span>
-                            ) : (
-                              <span className="text-gray-300">—</span>
-                            )}
-                          </td>
-                          <td className="px-6 py-3 text-right">
-                            <EditableCell value={client.amount} onSave={value => updateAmount(client.id, "amount", value)} />
-                          </td>
-                          <td className="px-6 py-3 text-right">
-                            <EditableCell value={client.nextAmount} onSave={value => updateAmount(client.id, "nextAmount", value)} />
-                          </td>
-                          <td className="px-6 py-3 text-xs">
-                            {client.multiDept ? <span className="text-blue-600">{depts.length} lines</span> : <span className="text-gray-400">1 line</span>}
-                          </td>
-                          <td className="px-6 py-3">
-                            <div className="flex items-center gap-2">
-                              <Badge status={client.status} />
-                              {client.status === "active" && (
-                                <button onClick={() => archiveClient(client.id)} className="text-xs text-gray-300 hover:text-red-400 transition-colors">
-                                  Archive
-                                </button>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {sortRows(bm.added).map(r => (
+                      <tr key={r.key} className="border-b border-gray-50 hover:bg-emerald-50 transition-colors">
+                        <td className="px-6 py-3 font-medium text-gray-800">{r.name}</td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{r.lead || "n/a"}</td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{[...new Set(r.lines.filter(l => !l.removed && l.amount).map(l => l.service).filter(Boolean))].join(", ")}</td>
+                        <td className="px-4 py-3 text-right text-gray-400">{fmt(0)}</td>
+                        <td className="px-4 py-3 text-right font-medium text-emerald-600">{fmt(r.amount)}</td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               )}
-            </div>
-          </div>
+            </Card>
+          </>
         )}
-        {tab === "invoices" && (
+
+        {/* ---------------- APPROVALS ---------------- */}
+        {tab === "approvals" && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between flex-wrap gap-2">
-              <h2 className="font-medium text-gray-800">Invoices — {currentMonthLabel || "this month"}</h2>
-              {!qboConnected && <p className="text-xs text-amber-600 bg-amber-50 px-3 py-1 rounded-full">Connect QBO to enable auto-send</p>}
-            </div>
-            <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-              {billingInvoices.length === 0 ? (
-                <div className="px-6 py-10 text-center text-gray-300 text-sm">No invoices — import your data first</div>
-              ) : (
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-xs text-gray-400 border-b border-gray-50">
-                      <th className="px-6 py-3 text-left">
-                        <button
-                          onClick={async () => {
-                            const newSort = clientSort === "az" ? "za" : "az";
-                            setClientSort(newSort);
-                            await persistSnapshot({ clientSort: newSort });
-                          }}
-                          className="hover:text-gray-600 transition-colors"
-                          title="Sort alphabetically"
-                        >
-                          Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
-                        </button>
-                      </th>
-                      <th className="px-6 py-3 text-left">Lead</th>
-                      <th className="px-6 py-3 text-right">Amount</th>
-                      <th className="px-6 py-3 text-left">QBO Lines</th>
-                      <th className="px-6 py-3 text-left">Approver</th>
-                      <th className="px-6 py-3 text-left">Status</th>
-                      <th className="px-6 py-3 text-left">Comment</th>
-                      <th className="px-6 py-3"></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {billingInvoices.map(inv => {
-                      const activeLines = inv.lines?.filter(line => (line.amounts[inv.monthCol] || 0) > 0) || [];
-                      return (
-                        <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
-                          <td className="px-6 py-3">
-                            <div className="font-medium text-gray-800">{inv.clientName}</div>
-                            {activeLines.length > 0 && (
-                              <button onClick={() => setShowInvoiceDetail(inv)} className="text-xs text-blue-500 hover:underline">
-                                View {activeLines.length} line{activeLines.length > 1 ? "s" : ""}
-                              </button>
-                            )}
-                          </td>
-                          <td className="px-6 py-3 text-xs">
-                            <EditableTextCell value={inv.lead} onSave={value => updateLead(inv.clientId, value)} placeholder="Lead name" />
-                          </td>
-                          <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.amount)}</td>
-                          <td className="px-6 py-3 text-xs">
-                            {inv.multiDept ? (
-                              <span className="text-blue-600 font-medium">{[...new Set(inv.lines?.map(line => line.department))].filter(Boolean).length} sep. lines</span>
-                            ) : (
-                              <span className="text-gray-400">1 line</span>
-                            )}
-                          </td>
-                          <td className="px-6 py-3 text-gray-500 text-xs">{inv.approver || "—"}</td>
-                          <td className="px-6 py-3">
-                            <Badge status={inv.status} />
-                          </td>
-                          <td className="px-6 py-3 text-gray-400 text-xs italic">{inv.comment || "—"}</td>
-                          <td className="px-6 py-3 text-right">
-                            <div className="flex gap-2 justify-end">
-                              {inv.status === "pending" && (
-                                <button
-                                  onClick={() => {
-                                    setShowApprove(inv);
-                                    setApproveComment(inv.comment || "");
-                                  }}
-                                  className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700"
-                                >
-                                  Review
-                                </button>
-                              )}
-                              {inv.status === "see notes" && (
-                                <button
-                                  onClick={() => {
-                                    setShowApprove(inv);
-                                    setApproveComment(inv.comment || "");
-                                  }}
-                                  className="text-xs bg-orange-500 text-white px-3 py-1 rounded-lg hover:bg-orange-600"
-                                >
-                                  See Notes
-                                </button>
-                              )}
-                              {inv.status === "approved" && qboConnected && (
-                                <button
-                                  onClick={() => sendInvoiceToQBO(inv)}
-                                  disabled={!!qboSendingId}
-                                  className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 disabled:opacity-40"
-                                >
-                                  {qboSendingId === inv.id ? "Sending..." : "Send via QBO"}
-                                </button>
-                              )}
-                              {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
-                              {inv.status === "rejected" && (
-                                <button onClick={() => resubmitInvoice(inv)} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50">
-                                  Resubmit
-                                </button>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
-            </div>
-          </div>
-        )}
-        {tab === "invoice approvals" && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between flex-wrap gap-3">
+            <div className="flex items-start justify-between flex-wrap gap-3">
               <div>
-                <h2 className="font-medium text-gray-800">Invoice Approvals</h2>
+                <h2 className="font-medium text-gray-800">Invoice Approvals, {ymLabel(M)}</h2>
                 <p className="text-xs text-gray-400 mt-0.5">
-                  Compare projected month ({approvalContext.curLabel || "selected"}) vs previous month ({approvalContext.prevLabel || "previous"})
+                  {ymLabel(M)} billing vs {prevLabel}
                 </p>
               </div>
               <div className="flex flex-col gap-2 items-end">
                 <div className="flex gap-2 flex-wrap justify-end items-center">
-                  {approvalMonthOptions.length > 0 && (
-                    <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
-                      <span className="text-xs text-gray-400">Approval month:</span>
-                      <select
-                        value={effectiveApprovalMonthKey}
-                        onChange={async e => {
-                          const newKey = e.target.value;
-                          setApprovalMonthKey(newKey);
-                          setFilterLead("all");
-                          setFilterStatus("all");
-                          await persistSnapshot({ approvalMonthKey: newKey });
-                        }}
-                        className="text-xs font-medium text-gray-700 outline-none bg-transparent"
-                      >
-                        {approvalMonthOptions.map(col => (
-                          <option key={col.h} value={col.h}>
-                            {formatMonthLabel(col.d)}{closedMonthKeys.includes(col.h) ? " (closed)" : ""}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  )}
-                  <div className="flex items-center gap-2 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
-                    <span className="text-xs text-gray-400">Sort:</span>
-                    <select
-                      value={clientSort}
-                      onChange={async e => {
-                        const newSort = e.target.value;
-                        setClientSort(newSort);
-                        await persistSnapshot({ clientSort: newSort });
-                      }}
-                      className="text-xs font-medium text-gray-700 outline-none bg-transparent"
-                    >
-                      <option value="sheet">Sheet order</option>
-                      <option value="az">A to Z</option>
-                      <option value="za">Z to A</option>
-                    </select>
-                  </div>
-                  {!isCurrentApprovalMonthClosed && (
-                    <button onClick={resetApprovalsForMonth} disabled={!effectiveApprovalMonthKey} className="px-3 py-2 rounded-lg text-xs font-medium border border-red-200 text-red-600 hover:bg-red-50 disabled:opacity-40">
+                  <select value={sortMode} onChange={e => setSortMode(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-2 text-xs outline-none text-gray-600 bg-white">
+                    <option value="az">Client A to Z</option>
+                    <option value="za">Client Z to A</option>
+                    <option value="amount">Billing amount</option>
+                    <option value="variance">Largest variance</option>
+                  </select>
+                  {!isClosed && (
+                    <button onClick={resetApprovals} className="px-3 py-2 rounded-lg text-xs font-medium border border-red-200 text-red-600 hover:bg-red-50">
                       Clear approvals for this month
                     </button>
                   )}
-                  {isCurrentApprovalMonthClosed ? (
-                    <span className="px-3 py-2 rounded-lg text-xs font-medium bg-gray-100 text-gray-400 border border-gray-200">
-                      🔒 Month closed
-                    </span>
+                  {isClosed ? (
+                    <span className="px-3 py-2 rounded-lg text-xs font-medium bg-gray-100 text-gray-400 border border-gray-200">🔒 Month closed</span>
                   ) : (
                     <button
                       onClick={() => setShowCloseConfirm(true)}
-                      disabled={!canCloseApprovalMonth}
-                      title={
-                        !approvalBase.length
-                          ? "No invoices to close"
-                          : !canCloseApprovalMonth
-                            ? `${notApprovedCount} invoice${notApprovedCount !== 1 ? "s are" : " is"} not approved yet`
-                            : `Close ${approvalContext.curLabel} and advance to ${approvalContext.nextLabel || "next month"}`
-                      }
+                      disabled={!canClose}
+                      title={!approvalBase.length ? "No invoices to close" : !canClose ? `${notApprovedCount} invoice${notApprovedCount !== 1 ? "s are" : " is"} not approved yet` : `Close ${ymLabel(M)} and move to ${ymLabel(ymAdd(M, 1))}`}
                       className="px-3 py-2 rounded-lg text-xs font-medium bg-gray-900 text-white hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                       Close Month →
@@ -1663,9 +1729,7 @@ Answer concisely in English. Use USD formatting.`;
                     <button
                       key={lead}
                       onClick={() => setFilterLead(lead)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${
-                        filterLead === lead ? "bg-gray-900 text-white" : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50"
-                      }`}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${filterLead === lead ? "bg-gray-900 text-white" : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50"}`}
                     >
                       {lead === "all" ? "All leads" : lead}
                     </button>
@@ -1673,467 +1737,497 @@ Answer concisely in English. Use USD formatting.`;
                 </div>
                 <div className="flex gap-1 flex-wrap justify-end">
                   {approvalStatuses.map(status => {
-                    const colors = {
-                      all: "bg-gray-900 text-white",
-                      pending: "bg-amber-500 text-white",
-                      approved: "bg-blue-600 text-white",
-                      "see notes": "bg-orange-500 text-white",
-                      rejected: "bg-red-500 text-white",
-                      sent: "bg-purple-600 text-white",
-                    };
-                    const inactive = "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50";
+                    const colors = { all: "bg-gray-900 text-white", pending: "bg-amber-500 text-white", approved: "bg-blue-600 text-white", "see notes": "bg-orange-500 text-white", rejected: "bg-red-500 text-white", sent: "bg-purple-600 text-white" };
                     return (
                       <button
                         key={status}
                         onClick={() => setFilterStatus(status)}
-                        className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${
-                          filterStatus === status ? colors[status] || "bg-gray-900 text-white" : inactive
-                        }`}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors capitalize ${filterStatus === status ? colors[status] : "bg-white border border-gray-200 text-gray-500 hover:bg-gray-50"}`}
                       >
-                        {status === "all" ? "All statuses" : status}
+                        {status === "all" ? "All statuses" : status === "sent" ? "Exported" : status}
                       </button>
                     );
                   })}
                 </div>
                 <div className="flex gap-2 text-xs">
-                  <span className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full">{filteredApprovals.filter(inv => inv.status === "pending").length} pending</span>
-                  <span className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full">{filteredApprovals.filter(inv => inv.status === "approved").length} approved</span>
+                  <span className="bg-amber-50 text-amber-700 px-3 py-1 rounded-full">{filteredApprovals.filter(r => r.status === "pending").length} pending</span>
+                  <span className="bg-blue-50 text-blue-700 px-3 py-1 rounded-full">{filteredApprovals.filter(r => r.status === "approved").length} approved</span>
+                  <span className="bg-gray-100 text-gray-600 px-3 py-1 rounded-full">{fmt(filteredApprovals.reduce((s, r) => s + r.amount, 0))}</span>
                 </div>
               </div>
             </div>
-            {isCurrentApprovalMonthClosed && (
-              <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-500 flex items-center gap-2">
-                <span>🔒</span>
-                <span><strong>{approvalContext.curLabel}</strong> is closed. Approvals are locked and cannot be changed.</span>
+            {isClosed && (
+              <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-500">
+                🔒 <strong>{ymLabel(M)}</strong> is closed. Approvals are locked.
               </div>
             )}
-            <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
+            <div className="bg-white rounded-2xl border border-gray-100 overflow-x-auto">
               {filteredApprovals.length === 0 ? (
-                <div className="px-6 py-10 text-center text-gray-300 text-sm">{approvalInvoices.length === 0 ? "No invoices — import your data first" : "No invoices for this filter"}</div>
+                <div className="px-6 py-10 text-center text-gray-300 text-sm">{approvalBase.length === 0 ? `No billing for ${ymLabel(M)}` : "No invoices for this filter"}</div>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="text-xs text-gray-400 border-b border-gray-50">
-                      <th className="px-6 py-3 text-left">
-                        <button
-                          onClick={async () => {
-                            const newSort = clientSort === "az" ? "za" : "az";
-                            setClientSort(newSort);
-                            await persistSnapshot({ clientSort: newSort });
-                          }}
-                          className="hover:text-gray-600 transition-colors"
-                          title="Sort alphabetically"
-                        >
-                          Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
-                        </button>
-                      </th>
-                      <th className="px-6 py-3 text-left">Lead</th>
-                      <th className="px-6 py-3 text-left">Departments</th>
-                      <th className="px-6 py-3 text-right">{approvalContext.prevLabel || "Previous"}</th>
-                      <th className="px-6 py-3 text-right">{approvalContext.curLabel || "Projected"}</th>
-                      <th className="px-6 py-3 text-right">Change</th>
-                      <th className="px-6 py-3 text-left">Status</th>
-                      <th className="px-6 py-3 text-left">Comment</th>
-                      <th className="px-6 py-3"></th>
+                      <th className="px-6 py-3 text-left">Client</th>
+                      <th className="px-4 py-3 text-left">Lead</th>
+                      <th className="px-4 py-3 text-right">{prevLabel}</th>
+                      <th className="px-4 py-3 text-right">{ymLabel(M)}</th>
+                      <th className="px-4 py-3 text-right">Change</th>
+                      <th className="px-4 py-3 text-left">Status</th>
+                      <th className="px-4 py-3 text-left">Comment</th>
+                      <th className="px-4 py-3"></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredApprovals.map(inv => {
-                      const diff = inv.amount - inv.lastAmount;
-                      const activeLines = inv.lines?.filter(line => (line.amounts[inv.monthCol] || 0) > 0) || [];
-                      const depts = [...new Set(inv.lines?.map(line => line.department).filter(Boolean))];
-                      return (
-                        <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
-                          <td className="px-6 py-3">
-                            <div className="font-medium text-gray-800">{inv.clientName}</div>
-                            {activeLines.length > 0 && (
-                              <button
-                                onClick={() => setShowInvoiceDetail({ ...inv, monthCol: inv.monthCol, month: approvalContext.curLabel, amount: inv.amount })}
-                                className="text-xs text-blue-500 hover:underline"
-                              >
-                                View {activeLines.length} line{activeLines.length > 1 ? "s" : ""}
-                              </button>
-                            )}
-                          </td>
-                          <td className="px-6 py-3 text-xs">
-                            {isCurrentApprovalMonthClosed ? (
-                              <span className="text-gray-500">{inv.lead || "—"}</span>
-                            ) : (
-                              <EditableTextCell value={inv.lead} onSave={value => updateLead(inv.clientId, value)} placeholder="Lead name" />
-                            )}
-                          </td>
-                          <td className="px-6 py-3">
-                            <div className="flex flex-wrap gap-1">
-                              {depts.map(dept => (
-                                <span key={dept} className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">
-                                  {dept}
-                                </span>
-                              ))}
+                    {filteredApprovals.map(r => (
+                      <tr key={r.key} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                        <td className="px-6 py-3">
+                          <div className="font-medium text-gray-800">{r.name}</div>
+                          <button onClick={() => setShowLines({ name: r.name, month: ymLabel(M), amount: r.amount, lines: r.lines.filter(l => !l.removed && l.amount) })} className="text-xs text-blue-500 hover:underline">
+                            View {r.lines.filter(l => !l.removed && l.amount).length} line{r.lines.filter(l => !l.removed && l.amount).length !== 1 ? "s" : ""}
+                          </button>
+                        </td>
+                        <td className="px-4 py-3 text-xs">{isClosed ? <span className="text-gray-500">{r.lead || "n/a"}</span> : <EditableText value={r.lead} onSave={v => setLead(r.key, v)} placeholder="Add lead" />}</td>
+                        <td className="px-4 py-3 text-right text-gray-500">{fmt(r.prevAmount)}</td>
+                        <td className="px-4 py-3 text-right font-medium text-gray-800">{fmt(r.amount)}</td>
+                        <td className={`px-4 py-3 text-right font-medium ${varColor(r.diff)}`}>{fmtSigned(r.diff)}</td>
+                        <td className="px-4 py-3">
+                          <Badge status={r.status} />
+                          {r.changedSinceApproval && <div className="text-xs text-amber-600 mt-1">Amount changed since approval ({fmt(r.approvedAmount)})</div>}
+                        </td>
+                        <td className="px-4 py-3 text-gray-400 text-xs italic max-w-xs">{r.comment || ""}</td>
+                        <td className="px-4 py-3 text-right">
+                          {isClosed ? (
+                            <span className="text-xs text-gray-300">🔒 locked</span>
+                          ) : (
+                            <div className="flex gap-2 justify-end">
+                              {r.status === "pending" && (
+                                <button onClick={() => openReview(r)} className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700">
+                                  Review
+                                </button>
+                              )}
+                              {r.status === "see notes" && (
+                                <button onClick={() => openReview(r)} className="text-xs bg-orange-500 text-white px-3 py-1 rounded-lg hover:bg-orange-600">
+                                  See Notes
+                                </button>
+                              )}
+                              {(r.status === "approved" || r.status === "sent") && (
+                                <button onClick={() => openReview(r)} className="text-xs text-gray-400 border border-gray-200 px-3 py-1 rounded-lg hover:bg-gray-50">
+                                  {r.changedSinceApproval ? "Re review" : "Edit"}
+                                </button>
+                              )}
+                              {r.status === "rejected" && (
+                                <button onClick={() => saveApproval(r.key, { status: "pending", comment: "" })} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50">
+                                  Resubmit
+                                </button>
+                              )}
                             </div>
-                          </td>
-                          <td className="px-6 py-3 text-right text-gray-500">{fmt(inv.lastAmount)}</td>
-                          <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.amount)}</td>
-                          <td className={`px-6 py-3 text-right font-medium ${diff >= 0 ? "text-emerald-600" : "text-red-500"}`}>
-                            {diff >= 0 ? "+" : ""}
-                            {fmt(diff)}
-                          </td>
-                          <td className="px-6 py-3">
-                            <Badge status={inv.status} />
-                          </td>
-                          <td className="px-6 py-3 text-gray-400 text-xs italic">{inv.comment || "—"}</td>
-                          <td className="px-6 py-3 text-right">
-                            {isCurrentApprovalMonthClosed ? (
-                              <span className="text-xs text-gray-300">🔒 locked</span>
-                            ) : (
-                              <div className="flex gap-2 justify-end">
-                                {inv.status === "pending" && (
-                                  <button
-                                    onClick={() => {
-                                      setShowApprove(inv);
-                                      setApproveComment(inv.comment || "");
-                                    }}
-                                    className="text-xs bg-gray-900 text-white px-3 py-1 rounded-lg hover:bg-gray-700"
-                                  >
-                                    Review
-                                  </button>
-                                )}
-                                {inv.status === "see notes" && (
-                                  <button
-                                    onClick={() => {
-                                      setShowApprove(inv);
-                                      setApproveComment(inv.comment || "");
-                                    }}
-                                    className="text-xs bg-orange-500 text-white px-3 py-1 rounded-lg hover:bg-orange-600"
-                                  >
-                                    See Notes
-                                  </button>
-                                )}
-                                {inv.status === "approved" && qboConnected && (
-                                  <button
-                                    onClick={() => sendInvoiceToQBO(inv)}
-                                    disabled={!!qboSendingId}
-                                    className="text-xs bg-purple-600 text-white px-3 py-1 rounded-lg hover:bg-purple-700 disabled:opacity-40"
-                                  >
-                                    {qboSendingId === inv.id ? "Sending..." : "Send via QBO"}
-                                  </button>
-                                )}
-                                {inv.status === "approved" && !qboConnected && <span className="text-xs text-gray-300">Connect QBO</span>}
-                                {inv.status === "rejected" && (
-                                  <button onClick={() => resubmitInvoice(inv)} className="text-xs text-amber-600 border border-amber-200 px-3 py-1 rounded-lg hover:bg-amber-50">
-                                    Resubmit
-                                  </button>
-                                )}
-                              </div>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                          )}
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               )}
             </div>
           </div>
         )}
-        {tab === "closed months" && (
+
+        {/* ---------------- CLOSED MONTHS ---------------- */}
+        {tab === "closed" && (
           <div className="space-y-4">
             <div className="flex items-center justify-between flex-wrap gap-3">
               <div>
                 <h2 className="font-medium text-gray-800">Closed Months</h2>
-                <p className="text-xs text-gray-400 mt-0.5">Review exactly what was approved and billed when a month was closed.</p>
+                <p className="text-xs text-gray-400 mt-0.5">What was approved and billed when each month was closed.</p>
               </div>
-              {closedMonthRecords.length > 0 && (
-                <select
-                  value={selectedClosedMonth?.monthKey || ""}
-                  onChange={e => setSelectedClosedMonthKey(e.target.value)}
-                  className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600 bg-white"
-                >
-                  {closedMonthRecords.map(month => (
-                    <option key={month.monthKey} value={month.monthKey}>
-                      {month.monthLabel || labelFromKey(month.monthKey)}
+              {closedRecords.length > 0 && (
+                <select value={closedSelected?.monthKey || ""} onChange={e => setSelectedClosed(e.target.value)} className="border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none text-gray-600 bg-white">
+                  {closedRecords.map(m => (
+                    <option key={m.monthKey} value={m.monthKey}>
+                      {m.monthLabel || ymLabel(m.monthKey)}
                     </option>
                   ))}
                 </select>
               )}
             </div>
-            {!selectedClosedMonth ? (
-              <div className="bg-white rounded-2xl border border-gray-100 px-6 py-10 text-center text-gray-300 text-sm">
-                No closed months yet. Once all approvals are done, close the month from Invoice Approvals.
-              </div>
+            {!closedSelected ? (
+              <div className="bg-white rounded-2xl border border-gray-100 px-6 py-10 text-center text-gray-300 text-sm">No closed months yet. Once every invoice is approved, close the month from Approvals.</div>
             ) : (
               <>
                 <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
-                  {[
-                    {
-                      label: "Closed month",
-                      value: selectedClosedMonth.monthLabel || labelFromKey(selectedClosedMonth.monthKey),
-                      sub: selectedClosedMonth.closedAt ? new Date(selectedClosedMonth.closedAt).toLocaleDateString() : "saved",
-                    },
-                    { label: "Billed total", value: fmt(selectedClosedMonth.total), sub: `${selectedClosedMonth.invoiceCount || 0} invoices` },
-                    { label: "Approved", value: selectedClosedMonth.approvedCount || 0, sub: "approval done" },
-                    { label: "Sent", value: selectedClosedMonth.sentCount || 0, sub: "sent to QBO" },
-                  ].map(card => (
-                    <div key={card.label} className="bg-white rounded-2xl p-5 border border-gray-100">
-                      <p className="text-xs text-gray-400 mb-1">{card.label}</p>
-                      <p className="text-2xl font-semibold text-gray-900">{card.value}</p>
-                      <p className="text-xs text-gray-400 mt-1">{card.sub}</p>
-                    </div>
-                  ))}
+                  <StatCard label="Closed month" value={closedSelected.monthLabel || ymLabel(closedSelected.monthKey)} sub={closedSelected.closedAt ? new Date(closedSelected.closedAt).toLocaleDateString("en-US") : "saved"} />
+                  <StatCard label="Billed total" value={fmt(closedSelected.total)} sub={`${closedSelected.invoiceCount || 0} invoices`} />
+                  <StatCard label="Approved" value={closedSelected.approvedCount || 0} sub="approved, not exported" />
+                  <StatCard label="Exported" value={closedSelected.sentCount || 0} sub="included in a QBO import file" />
                 </div>
-                <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-                  <div className="px-6 py-4 border-b border-gray-50 flex items-center justify-between">
-                    <h2 className="font-medium text-gray-800">Billed Invoices</h2>
-                    <span className="text-xs text-gray-400">{selectedClosedMonth.monthLabel || labelFromKey(selectedClosedMonth.monthKey)}</span>
-                  </div>
-                  {!selectedClosedMonth.invoices?.length ? (
-                    <div className="px-6 py-10 text-center text-gray-300 text-sm">No invoices were captured in this close.</div>
-                  ) : (
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-xs text-gray-400 border-b border-gray-50">
-                          <th className="px-6 py-3 text-left">
-                            <button
-                              onClick={async () => {
-                                const newSort = clientSort === "az" ? "za" : "az";
-                                setClientSort(newSort);
-                                await persistSnapshot({ clientSort: newSort });
-                              }}
-                              className="hover:text-gray-600 transition-colors"
-                              title="Sort alphabetically"
-                            >
-                              Client {clientSort === "az" ? "↑" : clientSort === "za" ? "↓" : "↕"}
-                            </button>
-                          </th>
-                          <th className="px-6 py-3 text-left">Lead</th>
-                          <th className="px-6 py-3 text-right">Amount</th>
-                          <th className="px-6 py-3 text-left">Status</th>
-                          <th className="px-6 py-3 text-left">Approver</th>
-                          <th className="px-6 py-3 text-left">Comment</th>
-                          <th className="px-6 py-3"></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {sortClientsBy(selectedClosedMonth.invoices, clientSort, inv => inv.clientName).map(inv => (
-                          <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50 transition-colors">
+                <Card title="Billed invoices" right={<span className="text-xs text-gray-400">{closedSelected.monthLabel}</span>}>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-xs text-gray-400 border-b border-gray-50">
+                        <th className="px-6 py-3 text-left">Client</th>
+                        <th className="px-4 py-3 text-left">Lead</th>
+                        <th className="px-4 py-3 text-right">Amount</th>
+                        <th className="px-4 py-3 text-left">Status</th>
+                        <th className="px-4 py-3 text-left">Approver</th>
+                        <th className="px-4 py-3 text-left">Comment</th>
+                        <th className="px-4 py-3"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...(closedSelected.invoices || [])]
+                        .sort((a, b) => String(a.clientName).localeCompare(String(b.clientName), "en", { sensitivity: "base" }))
+                        .map(inv => (
+                          <tr key={inv.id} className="border-b border-gray-50 hover:bg-gray-50">
                             <td className="px-6 py-3 font-medium text-gray-800">{inv.clientName}</td>
-                            <td className="px-6 py-3 text-xs text-gray-500">{inv.lead || "—"}</td>
-                            <td className="px-6 py-3 text-right font-medium text-gray-800">{fmt(inv.amount)}</td>
-                            <td className="px-6 py-3">
-                              <Badge status={inv.status} />
+                            <td className="px-4 py-3 text-xs text-gray-500">{inv.lead || "n/a"}</td>
+                            <td className="px-4 py-3 text-right font-medium text-gray-800">{fmt(inv.amount)}</td>
+                            <td className="px-4 py-3">
+                              <Badge status={inv.status || "pending"} />
                             </td>
-                            <td className="px-6 py-3 text-xs text-gray-500">{inv.approver || "—"}</td>
-                            <td className="px-6 py-3 text-gray-400 text-xs italic">{inv.comment || "—"}</td>
-                            <td className="px-6 py-3 text-right">
+                            <td className="px-4 py-3 text-xs text-gray-500">{inv.approver || "n/a"}</td>
+                            <td className="px-4 py-3 text-gray-400 text-xs italic">{inv.comment || ""}</td>
+                            <td className="px-4 py-3 text-right">
                               {!!inv.lines?.length && (
-                                <button onClick={() => setShowInvoiceDetail(inv)} className="text-xs text-blue-500 hover:underline">
+                                <button onClick={() => setShowLines({ name: inv.clientName, month: closedSelected.monthLabel, amount: inv.amount, lines: inv.lines })} className="text-xs text-blue-500 hover:underline">
                                   View {inv.lines.length} line{inv.lines.length > 1 ? "s" : ""}
                                 </button>
                               )}
                             </td>
                           </tr>
                         ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
+                    </tbody>
+                  </table>
+                </Card>
               </>
             )}
           </div>
         )}
-        {tab === "ai assistant" && (
-          <div className="bg-white rounded-2xl border border-gray-100 flex flex-col" style={{ height: "520px" }}>
-            <div className="px-6 py-4 border-b border-gray-50">
-              <h2 className="font-medium text-gray-800">AI Finance Assistant</h2>
-              <p className="text-xs text-gray-400">Ask anything about your clients, invoices, or monthly performance</p>
-            </div>
-            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3">
-              {aiMessages.map((msg, idx) => (
-                <div key={idx} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
-                  <div className={`max-w-xs md:max-w-md px-4 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${msg.role === "user" ? "bg-gray-900 text-white" : "bg-gray-100 text-gray-800"}`}>
-                    {msg.content}
+
+        {/* ---------------- DATA SOURCES ---------------- */}
+        {tab === "data" && (
+          <div className="space-y-6">
+            <Card
+              title="Financial model, Forecasted Revenue tab"
+              subtitle={data.forecast.syncedAt ? `Last synced ${new Date(data.forecast.syncedAt).toLocaleString("en-US")} · ${data.forecast.source}` : data.forecast.source || "Not synced yet"}
+              right={
+                hasForecast && (
+                  <span className="text-xs text-gray-400">
+                    {data.forecast.lines.length} lines · {new Set(data.forecast.lines.map(l => clientKey(l.clientName))).size} clients
+                  </span>
+                )
+              }
+            >
+              <div className="px-6 py-4 space-y-3">
+                <div className="flex gap-2 flex-wrap">
+                  <input value={modelUrl} onChange={e => setModelUrl(e.target.value)} className="flex-1 min-w-[280px] border border-gray-200 rounded-lg px-3 py-2 text-xs outline-none focus:border-gray-400 font-mono" />
+                  <button onClick={syncModel} disabled={syncing} className="bg-gray-900 text-white text-sm px-4 py-2 rounded-lg hover:bg-gray-700 disabled:opacity-40">
+                    {syncing ? "Syncing..." : "Sync now"}
+                  </button>
+                </div>
+                <div className="flex gap-2 flex-wrap items-center text-xs">
+                  <label className="border border-gray-200 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-50 cursor-pointer">
+                    Upload file (xlsx or csv)
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls,.csv"
+                      className="hidden"
+                      onChange={e => {
+                        uploadModelFile(e.target.files?.[0]);
+                        e.target.value = "";
+                      }}
+                    />
+                  </label>
+                  <button onClick={() => setShowPaste(v => !v)} className="border border-gray-200 rounded-lg px-3 py-1.5 text-gray-600 hover:bg-gray-50">
+                    {showPaste ? "Hide paste" : "Paste from the sheet"}
+                  </button>
+                  <span className="text-gray-400">Live sync needs the spreadsheet shared as Anyone with the link can view. Otherwise download the tab (File, Download, CSV) and upload it, or paste it.</span>
+                </div>
+                {showPaste && (
+                  <div className="space-y-2">
+                    <p className="text-xs text-gray-500">In the Forecasted Revenue tab, select from the header row (Client Name, Service, Department, months) down to the last client, copy and paste here.</p>
+                    <textarea value={pasteText} onChange={e => setPasteText(e.target.value)} rows={6} className="w-full border border-gray-200 rounded-xl px-3 py-2 text-xs font-mono outline-none focus:border-gray-400" />
+                    <button onClick={applyPaste} disabled={!pasteText.trim()} className="bg-gray-900 text-white text-xs px-4 py-2 rounded-lg hover:bg-gray-700 disabled:opacity-40">
+                      Load pasted data
+                    </button>
                   </div>
-                </div>
-              ))}
-              {aiLoading && (
-                <div className="flex justify-start">
-                  <div className="bg-gray-100 text-gray-400 px-4 py-2.5 rounded-2xl text-sm">Thinking...</div>
-                </div>
+                )}
+                {syncError && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{syncError}</p>}
+                {hasForecast && data.forecast.totals && data.forecast.totals[M] !== undefined && (
+                  <p className={`text-xs ${Math.abs(data.forecast.totals[M] - bm.modelTotalForM) < 1 ? "text-emerald-600" : "text-amber-600"}`}>
+                    Tie out for {ymLabel(M)}: client lines {fmt(bm.modelTotalForM)} vs model Totals row {fmt(data.forecast.totals[M])}
+                    {Math.abs(data.forecast.totals[M] - bm.modelTotalForM) < 1 ? ", ties." : `, difference ${fmt(data.forecast.totals[M] - bm.modelTotalForM)}.`}
+                  </p>
+                )}
+                <p className="text-xs text-gray-400">Syncing replaces the model lines only. Your edits, removed lines, added lines, leads and approvals are kept.</p>
+              </div>
+            </Card>
+
+            <Card
+              title="QBO actuals"
+              subtitle="Upload the QBO export of past invoices. Sales by Customer Detail (or Transaction List by Customer) with Date, Num, Customer, Product/Service, Memo/Description, Class, Terms, Due date and Amount works best, since it also feeds the import file."
+              right={
+                (data.actuals.lines || []).length > 0 && (
+                  <button onClick={clearActuals} className="text-xs text-red-500 hover:underline">
+                    Clear actuals
+                  </button>
+                )
+              }
+            >
+              <div className="px-6 py-4 space-y-3">
+                <label className="block border-2 border-dashed border-gray-200 rounded-2xl p-6 text-center cursor-pointer hover:border-emerald-300 hover:bg-emerald-50 transition-colors">
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv"
+                    className="hidden"
+                    onChange={e => {
+                      uploadActuals(e.target.files?.[0]);
+                      e.target.value = "";
+                    }}
+                  />
+                  <p className="text-sm font-medium text-gray-600">Click to attach the QBO Excel export</p>
+                  <p className="text-xs text-gray-400 mt-1">Months in a new file replace the same months from earlier uploads</p>
+                </label>
+                {actualsMsg && <p className="text-xs text-emerald-700 bg-emerald-50 rounded-lg px-3 py-2">{actualsMsg}</p>}
+                {actualsError && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{actualsError}</p>}
+                {bm.actualMonths.length > 0 && (
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="text-gray-400 border-b border-gray-50">
+                        <th className="py-2 text-left font-normal">Month</th>
+                        <th className="py-2 text-right font-normal">Customers</th>
+                        <th className="py-2 text-right font-normal">Invoices</th>
+                        <th className="py-2 text-right font-normal">Total billed</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...bm.actualMonths].reverse().map(ym => {
+                        const ls = data.actuals.lines.filter(l => l.ym === ym);
+                        return (
+                          <tr key={ym} className="border-b border-gray-50">
+                            <td className="py-1.5 text-gray-700">{ymLabel(ym)}</td>
+                            <td className="py-1.5 text-right text-gray-500">{Object.keys(bm.actualsByYm[ym] || {}).length}</td>
+                            <td className="py-1.5 text-right text-gray-500">{new Set(ls.map(l => l.num || `${l.customer}|${l.date}`)).size}</td>
+                            <td className="py-1.5 text-right font-medium text-gray-800">{fmt(ls.reduce((s, l) => s + l.amount, 0))}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </Card>
+
+            <Card
+              title="QBO customer matching"
+              subtitle="QBO customers are matched to model clients by name, ignoring case, punctuation and LLC or Inc. Map the ones that did not match so actuals land on the right client."
+              right={
+                mappedCustomers.length > 0 && (
+                  <button onClick={() => setShowAllMappings(v => !v)} className="text-xs text-blue-500 hover:underline">
+                    {showAllMappings ? "Hide manual mappings" : `Show ${mappedCustomers.length} manual mappings`}
+                  </button>
+                )
+              }
+            >
+              {bm.qboCustomers.length === 0 ? (
+                <div className="px-6 py-6 text-center text-gray-300 text-sm">Upload QBO actuals to see customer matching.</div>
+              ) : unmatchedCustomers.length === 0 && !showAllMappings ? (
+                <div className="px-6 py-6 text-center text-emerald-600 text-sm">All {bm.qboCustomers.length} QBO customers are matched.</div>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-xs text-gray-400 border-b border-gray-50">
+                      <th className="px-6 py-3 text-left">QBO customer</th>
+                      <th className="px-4 py-3 text-right">Total in actuals</th>
+                      <th className="px-4 py-3 text-left">Model client</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[...unmatchedCustomers, ...(showAllMappings ? mappedCustomers : [])].map(c => (
+                      <tr key={c.name} className="border-b border-gray-50">
+                        <td className="px-6 py-2 text-gray-800">{c.name}</td>
+                        <td className="px-4 py-2 text-right text-gray-500">{fmt(c.total)}</td>
+                        <td className="px-4 py-2">
+                          <select value={data.customerMap?.[c.name] || ""} onChange={e => setMapping(c.name, e.target.value)} className="w-full max-w-sm border border-gray-200 rounded-lg px-2 py-1.5 text-xs outline-none bg-white">
+                            <option value="">Not in the model, keep as its own client</option>
+                            {modelClientOptions.map(([key, name]) => (
+                              <option key={key} value={key}>
+                                {name}
+                              </option>
+                            ))}
+                          </select>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               )}
-              <div ref={chatEndRef} />
-            </div>
-            <div className="px-6 py-4 border-t border-gray-50 flex gap-3">
-              <input
-                value={aiInput}
-                onChange={e => setAiInput(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && sendAI()}
-                placeholder="e.g. Which clients have more than one department?"
-                className="flex-1 border border-gray-200 rounded-xl px-4 py-2 text-sm outline-none focus:border-gray-400"
-              />
-              <button onClick={sendAI} disabled={aiLoading} className="bg-gray-900 text-white px-4 py-2 rounded-xl text-sm hover:bg-gray-700 disabled:opacity-40">
-                Send
-              </button>
-            </div>
+            </Card>
+
+            <Card title="Leads" subtitle="Leads drive the approval filters. Edit them inline in Billing or Approvals, or paste a Client and Lead table here (with headers).">
+              <div className="px-6 py-4 space-y-2">
+                <textarea value={leadPaste} onChange={e => setLeadPaste(e.target.value)} rows={4} placeholder={"Client\tLead\nAcme Corp\tSarah Johnson"} className="w-full border border-gray-200 rounded-xl px-3 py-2 text-xs font-mono outline-none focus:border-gray-400" />
+                <button onClick={importLeads} disabled={!leadPaste.trim()} className="bg-gray-900 text-white text-xs px-4 py-2 rounded-lg hover:bg-gray-700 disabled:opacity-40">
+                  Update leads
+                </button>
+              </div>
+            </Card>
           </div>
         )}
       </div>
-      {showContract && (
-        <Modal title="Upload Contract" onClose={resetContractModal} wide>
-          {contractStep === "upload" && (
-            <div className="space-y-4">
-              <div className="bg-blue-50 rounded-xl p-3 text-xs text-blue-700 space-y-1">
-                <p className="font-medium">How it works:</p>
-                <p>1. Attach the client's contract as a PDF</p>
-                <p>2. The AI reads it and extracts the client, the monthly fixed fee and the contract term</p>
-                <p>3. You review the extracted data and confirm</p>
-                <p>4. Billing is loaded automatically for every month within the contract term</p>
-              </div>
-              {!monthCols.length && (
-                <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
-                  Import your sheet first so the dashboard knows which months exist. The contract fee is applied to the imported month columns.
-                </div>
-              )}
-              <label className="block border-2 border-dashed border-gray-200 rounded-2xl p-8 text-center cursor-pointer hover:border-blue-300 hover:bg-blue-50 transition-colors">
-                <input
-                  type="file"
-                  accept="application/pdf"
-                  className="hidden"
-                  onChange={e => {
-                    setContractFile(e.target.files?.[0] || null);
-                    setContractError("");
-                  }}
-                />
-                {contractFile ? (
-                  <div className="space-y-1">
-                    <p className="text-sm font-medium text-gray-800">{contractFile.name}</p>
-                    <p className="text-xs text-gray-400">{(contractFile.size / 1024).toFixed(0)} KB · click to change</p>
-                  </div>
-                ) : (
-                  <div className="space-y-1">
-                    <p className="text-sm font-medium text-gray-600">Click to attach the contract (PDF)</p>
-                    <p className="text-xs text-gray-400">The document is read locally and analyzed by AI</p>
-                  </div>
-                )}
-              </label>
-              {contractError && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{contractError}</p>}
-              <div className="flex gap-3">
-                <button onClick={resetContractModal} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
-                  Cancel
-                </button>
-                <button
-                  onClick={handleParseContract}
-                  disabled={!contractFile || contractParsing || !monthCols.length}
-                  className="flex-1 bg-blue-600 text-white rounded-lg py-2 text-sm hover:bg-blue-700 disabled:opacity-40"
-                >
-                  {contractParsing ? "Reading contract..." : "Read contract with AI"}
-                </button>
-              </div>
-            </div>
-          )}
-          {contractStep === "review" && contractResult && (
-            <div className="space-y-4">
-              <div className="bg-emerald-50 rounded-xl p-3 text-xs text-emerald-700">
-                Data extracted from <strong>{contractFile?.name}</strong>. Review and edit before confirming, then the fee will be loaded for every month within the term.
-              </div>
-              <div className="grid grid-cols-2 gap-3">
-                {[
-                  ["Client name *", "clientName", "text"],
-                  ["Service", "service", "text"],
-                  ["Department", "department", "text"],
-                  ["Currency", "currency", "text"],
-                ].map(([label, key, type]) => (
-                  <div key={key}>
-                    <label className="text-xs text-gray-500 mb-1 block">{label}</label>
-                    <input
-                      type={type}
-                      value={contractResult[key]}
-                      onChange={e => setContractResult(prev => ({ ...prev, [key]: e.target.value }))}
-                      className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
-                    />
-                  </div>
+
+      {/* ---------------- MODALS ---------------- */}
+      {showAddLine && (
+        <Modal title={`Add billing line, ${ymLabel(M)}`} onClose={() => setShowAddLine(false)}>
+          <div className="space-y-3">
+            <p className="text-xs text-gray-500">The line is added to this dashboard for {ymLabel(M)} only. It does not change the financial model.</p>
+            <div>
+              <label className="text-xs text-gray-500 mb-1 block">Client *</label>
+              <input
+                list="client-options"
+                value={newLine.clientName}
+                onChange={e => setNewLine(prev => ({ ...prev, clientName: e.target.value }))}
+                className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
+              />
+              <datalist id="client-options">
+                {modelClientOptions.map(([key, name]) => (
+                  <option key={key} value={name} />
                 ))}
-                <div>
-                  <label className="text-xs text-gray-500 mb-1 block">Monthly fixed fee *</label>
-                  <input
-                    type="number"
-                    value={contractResult.monthlyFee}
-                    onChange={e => setContractResult(prev => ({ ...prev, monthlyFee: parseFloat(e.target.value) || 0 }))}
-                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-gray-500 mb-1 block">Start (YYYY-MM)</label>
-                  <input
-                    type="text"
-                    value={contractResult.startDate}
-                    placeholder="2026-01"
-                    onChange={e => setContractResult(prev => ({ ...prev, startDate: e.target.value }))}
-                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
-                  />
-                </div>
-                <div>
-                  <label className="text-xs text-gray-500 mb-1 block">End (YYYY-MM, blank if open)</label>
-                  <input
-                    type="text"
-                    value={contractResult.endDate}
-                    placeholder=""
-                    onChange={e => setContractResult(prev => ({ ...prev, endDate: e.target.value }))}
-                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
-                  />
-                </div>
-              </div>
-              {contractResult.notes && (
-                <div className="bg-gray-50 rounded-xl p-3 text-xs text-gray-600">
-                  <span className="font-medium">Contract notes:</span> {contractResult.notes}
-                </div>
-              )}
-              <div className="bg-white border border-gray-100 rounded-xl overflow-hidden">
-                <div className="px-4 py-2 border-b border-gray-50 text-xs text-gray-400">Billing preview per month</div>
-                <div className="px-4 py-2 flex flex-wrap gap-2">
-                  {monthCols.map(col => {
-                    const amounts = buildContractAmounts(contractResult);
-                    const amt = amounts[col.h] || 0;
-                    return (
-                      <span key={col.h} className={`text-xs px-2 py-1 rounded-lg ${amt > 0 ? "bg-emerald-50 text-emerald-700" : "bg-gray-50 text-gray-300"}`}>
-                        {formatMonthLabel(col.d)}: {fmt(amt)}
-                      </span>
-                    );
-                  })}
-                </div>
-              </div>
-              {clients.some(c => makeClientKey(c.name) === makeClientKey(contractResult.clientName)) && (
-                <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
-                  This client already exists. The contract fee will be added as a new billing line on top of its current amounts.
-                </div>
-              )}
-              <div className="flex gap-3">
-                <button
-                  onClick={() => setContractStep("upload")}
-                  className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50"
-                >
-                  Back
-                </button>
-                <button
-                  onClick={applyContract}
-                  disabled={!contractResult.clientName.trim() || !contractResult.monthlyFee}
-                  className="flex-1 bg-blue-600 text-white rounded-lg py-2 text-sm hover:bg-blue-700 disabled:opacity-40"
-                >
-                  Confirm and add billing
-                </button>
-              </div>
+              </datalist>
             </div>
-          )}
+            {[
+              ["Service", "service"],
+              ["Department", "department"],
+            ].map(([label, key]) => (
+              <div key={key}>
+                <label className="text-xs text-gray-500 mb-1 block">{label}</label>
+                <input value={newLine[key]} onChange={e => setNewLine(prev => ({ ...prev, [key]: e.target.value }))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400" />
+              </div>
+            ))}
+            <div>
+              <label className="text-xs text-gray-500 mb-1 block">Amount for {ymLabel(M)} *</label>
+              <input value={newLine.amount} onChange={e => setNewLine(prev => ({ ...prev, amount: e.target.value }))} placeholder="0.00" className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400" />
+            </div>
+            <div className="flex gap-3 pt-2">
+              <button onClick={() => setShowAddLine(false)} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
+                Cancel
+              </button>
+              <button onClick={addLine} disabled={!newLine.clientName.trim() || parseAmount(newLine.amount) === null} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">
+                Add line
+              </button>
+            </div>
+          </div>
         </Modal>
       )}
+
+      {showApprove && (
+        <Modal title={`Review invoice, ${showApprove.name}`} onClose={() => setShowApprove(null)}>
+          <div className="space-y-4">
+            <div className="bg-gray-50 rounded-xl p-4 text-sm space-y-2">
+              <div className="flex justify-between">
+                <span className="text-gray-500">Lead</span>
+                <span>{showApprove.lead || "n/a"}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">{prevLabel}</span>
+                <span>{fmt(showApprove.prevAmount)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">{ymLabel(M)}</span>
+                <span className="font-semibold text-gray-900">{fmt(showApprove.amount)}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-gray-500">Variance</span>
+                <span className={varColor(showApprove.diff)}>
+                  {fmtSigned(showApprove.diff)} ({fmtPct(showApprove.amount, showApprove.prevAmount)})
+                </span>
+              </div>
+              <div className="border-t border-gray-200 pt-2 space-y-1">
+                {showApprove.lines
+                  .filter(l => !l.removed && l.amount)
+                  .map(l => (
+                    <div key={l.id} className="flex justify-between text-xs text-gray-500">
+                      <span>
+                        {l.service || "Line"}
+                        {l.department ? `, ${l.department}` : ""}
+                      </span>
+                      <span>{fmt(l.amount)}</span>
+                    </div>
+                  ))}
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 mb-1 block">Approver</label>
+              <select value={approveApprover} onChange={e => setApproveApprover(e.target.value)} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none">
+                {[...new Set([approveApprover, ...approvers].filter(Boolean))].map(a => (
+                  <option key={a}>{a}</option>
+                ))}
+                {!approveApprover && !approvers.length && <option value="">n/a</option>}
+              </select>
+            </div>
+            <div>
+              <label className="text-xs text-gray-500 mb-1 block">Comment (optional)</label>
+              <textarea value={approveComment} onChange={e => setApproveComment(e.target.value)} rows={2} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none resize-none focus:border-gray-400" />
+            </div>
+            <div className="flex gap-3">
+              <button onClick={() => decide("rejected")} className="flex-1 border border-red-200 text-red-600 rounded-lg py-2 text-sm hover:bg-red-50">
+                Reject
+              </button>
+              <button onClick={() => decide("see notes")} className="flex-1 border border-orange-200 text-orange-600 rounded-lg py-2 text-sm hover:bg-orange-50">
+                See Notes
+              </button>
+              <button onClick={() => decide("approved")} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700">
+                Approve
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {showLines && (
+        <Modal title={`Invoice lines, ${showLines.name}`} onClose={() => setShowLines(null)} size="wide">
+          <div className="space-y-3">
+            <p className="text-xs text-gray-400">Month: {showLines.month}</p>
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-xs text-gray-400 border-b border-gray-100">
+                  <th className="py-2 text-left">Service</th>
+                  <th className="py-2 text-left">Department</th>
+                  <th className="py-2 text-right">Amount</th>
+                </tr>
+              </thead>
+              <tbody>
+                {showLines.lines.map((l, i) => (
+                  <tr key={i} className="border-b border-gray-50">
+                    <td className="py-2 text-gray-700">
+                      {l.service || "n/a"}
+                      {l.manual && <span className="ml-2 text-xs bg-emerald-50 text-emerald-700 px-2 py-0.5 rounded-full">added</span>}
+                      {l.edited && <span className="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">edited</span>}
+                    </td>
+                    <td className="py-2 text-xs text-gray-500">{l.department || "n/a"}</td>
+                    <td className="py-2 text-right font-medium text-gray-800">{fmt(l.amount)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td colSpan={2} className="pt-3 text-sm font-medium text-gray-600">
+                    Total
+                  </td>
+                  <td className="pt-3 text-right font-semibold text-gray-900">{fmt(showLines.amount)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </Modal>
+      )}
+
       {showCloseConfirm && (
         <Modal title="Close Month" onClose={() => setShowCloseConfirm(false)}>
           <div className="space-y-4">
             <p className="text-sm text-gray-600">
-              Close <strong>{approvalContext.curLabel}</strong>? All {approvalBase.length} approval{approvalBase.length !== 1 ? "s" : ""} will be locked and the billed invoice snapshot will be saved.
-              {approvalContext.nextKey && (
-                <span> The billing and approval month will advance to <strong>{approvalContext.nextLabel}</strong>.</span>
-              )}
+              Close <strong>{ymLabel(M)}</strong>? All {approvalBase.length} approvals will be locked and a snapshot of the billed invoices will be saved. The billing month will move to <strong>{ymLabel(ymAdd(M, 1))}</strong>.
             </p>
-            <p className="text-xs text-gray-400">You can review the closed month later from the Closed Months tab, even if the imported sheet changes.</p>
             <div className="flex gap-3 pt-2">
               <button onClick={() => setShowCloseConfirm(false)} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
                 Cancel
@@ -2145,220 +2239,121 @@ Answer concisely in English. Use USD formatting.`;
           </div>
         </Modal>
       )}
-      {showImport && (
-        <Modal title="Import from Google Sheets" onClose={() => setShowImport(false)} wide>
+
+      {showExport && exportData && (
+        <Modal title={`QBO invoice import, ${ymLabel(M)}`} onClose={() => setShowExport(false)} size="xl">
           <div className="space-y-4">
-            <div className="flex rounded-xl overflow-hidden border border-gray-100">
-              {["clients", "leads"].map((step, idx) => (
-                <button
-                  key={step}
-                  onClick={() => setImportStep(step)}
-                  className={`flex-1 py-2 text-sm font-medium transition-colors ${importStep === step ? "bg-gray-900 text-white" : "bg-gray-50 text-gray-500 hover:bg-gray-100"}`}
-                >
-                  {idx + 1}. {step === "clients" ? "Forecasted Revenues" : "Leads (team)"}
-                </button>
-              ))}
-            </div>
-            {importStep === "clients" && (
-              <div className="space-y-3">
-                <div className="bg-blue-50 rounded-xl p-3 text-xs text-blue-700 space-y-1">
-                  <p className="font-medium">How to copy your data:</p>
-                  <p>1. Open the <strong>Forecasted Revenues</strong> tab</p>
-                  <p>2. Click on cell <strong>D1</strong> (Client Name header)</p>
-                  <p>3. Select all data from D1 to the last column and row with data</p>
-                  <p>4. Copy (Ctrl+C / Cmd+C) and paste below</p>
-                  <p className="text-blue-500">Manual clients, contract lines, manually edited leads and per-month approval history are preserved on re-import.</p>
-                </div>
-                <textarea
-                  value={clientPaste}
-                  onChange={e => setClientPaste(e.target.value)}
-                  placeholder={"Client Name\tService\tDepartment\t01/01/2025\t02/01/2025\nAcme Corp\tPaid\tCore Growth\t4500\t5000"}
-                  className="w-full border border-gray-200 rounded-xl px-4 py-3 text-xs font-mono outline-none focus:border-gray-400 resize-none"
-                  rows={9}
-                />
-                <button onClick={() => setImportStep("leads")} disabled={!clientPaste.trim()} className="w-full bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">
-                  Next: Paste team data
-                </button>
-              </div>
-            )}
-            {importStep === "leads" && (
-              <div className="space-y-3">
-                <div className="bg-blue-50 rounded-xl p-3 text-xs text-blue-700 space-y-1">
-                  <p className="font-medium">How to copy your team:</p>
-                  <p>1. Open the <strong>Leads</strong> tab</p>
-                  <p>2. Select all data including headers (<strong>Client</strong> and <strong>Lead</strong> columns)</p>
-                  <p>3. Copy and paste below</p>
-                </div>
-                <textarea
-                  value={leadPaste}
-                  onChange={e => setLeadPaste(e.target.value)}
-                  placeholder={"Client\tLead\nAcme Corp\tSarah Johnson"}
-                  className="w-full border border-gray-200 rounded-xl px-4 py-3 text-xs font-mono outline-none focus:border-gray-400 resize-none"
-                  rows={6}
-                />
-                {importError && <p className="text-xs text-red-500 bg-red-50 rounded-lg px-3 py-2">{importError}</p>}
-                <div className="flex gap-3">
-                  <button onClick={() => setImportStep("clients")} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
-                    Back
-                  </button>
-                  <button onClick={processImport} disabled={!clientPaste.trim()} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">
-                    Import data
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        </Modal>
-      )}
-      {showAddClient && (
-        <Modal title="Add New Client" onClose={() => setShowAddClient(false)}>
-          <div className="space-y-3">
-            <div className="bg-amber-50 rounded-xl p-3 text-xs text-amber-700">
-              This client is added manually and won't affect your Google Sheet. It will be saved to the dashboard automatically and preserved on re-import.
-            </div>
-            {[["Client Name *", "name", "text"], ["Service", "service", "text"], ["Department", "department", "text"], ["Lead", "lead", "text"]].map(([label, key, type]) => (
-              <div key={key}>
-                <label className="text-xs text-gray-500 mb-1 block">{label}</label>
-                <input
-                  type={type}
-                  value={newClient[key]}
-                  onChange={e => setNewClient(prev => ({ ...prev, [key]: e.target.value }))}
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
-                />
-              </div>
-            ))}
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
               <div>
-                <label className="text-xs text-gray-500 mb-1 block">{currentMonthLabel || "Current month"} ($)</label>
-                <input
-                  type="number"
-                  value={newClient.currentAmt}
-                  onChange={e => setNewClient(prev => ({ ...prev, currentAmt: e.target.value }))}
-                  placeholder="0"
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
-                />
+                <label className="text-xs text-gray-500 mb-1 block">Include</label>
+                <select value={exportOpts.scope} onChange={e => setExportOpts(o => ({ ...o, scope: e.target.value }))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none bg-white">
+                  <option value="approved">Approved only</option>
+                  <option value="approved_sent">Approved and already exported</option>
+                  <option value="all">All clients with billing</option>
+                </select>
               </div>
               <div>
-                <label className="text-xs text-gray-500 mb-1 block">{nextMonthLabel || "Next month"} ($)</label>
+                <label className="text-xs text-gray-500 mb-1 block">Invoice date</label>
+                <input type="date" value={exportOpts.invoiceDate} onChange={e => setExportOpts(o => ({ ...o, invoiceDate: e.target.value }))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none" />
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 mb-1 block">Invoice numbers</label>
+                <select value={exportOpts.autoNumber ? "auto" : "seq"} onChange={e => setExportOpts(o => ({ ...o, autoNumber: e.target.value === "auto" }))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none bg-white">
+                  <option value="seq">Continue the QBO sequence</option>
+                  <option value="auto">Blank, QBO auto numbers</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-gray-500 mb-1 block">First invoice number</label>
                 <input
-                  type="number"
-                  value={newClient.nextAmt}
-                  onChange={e => setNewClient(prev => ({ ...prev, nextAmt: e.target.value }))}
-                  placeholder="0"
-                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-gray-400"
+                  value={exportOpts.startNo}
+                  disabled={exportOpts.autoNumber}
+                  onChange={e => setExportOpts(o => ({ ...o, startNo: e.target.value.replace(/[^0-9]/g, "") }))}
+                  placeholder={exportData.maxNum ? String(exportData.maxNum + 1) : "1001"}
+                  className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none disabled:bg-gray-50 disabled:text-gray-300"
                 />
               </div>
             </div>
-            <div className="flex gap-3 pt-2">
-              <button
-                onClick={() => {
-                  setShowAddClient(false);
-                  setNewClient({ name: "", service: "", department: "", lead: "", currentAmt: "", nextAmt: "" });
-                }}
-                className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50"
-              >
-                Cancel
-              </button>
-              <button onClick={addClientManually} disabled={!newClient.name.trim()} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">
-                Add Client
-              </button>
+
+            <div className="grid grid-cols-3 gap-3">
+              <StatCard label="Invoices" value={exportData.invoices.length} sub={`${exportData.invoices.reduce((s, i) => s + i.lines.length, 0)} lines`} />
+              <StatCard label="Total" value={fmt(exportData.total)} sub={`${ymLabel(M)} billing ${fmt(bm.total)}`} />
+              <StatCard label="Exceptions" value={exportData.actionable} sub={`review before importing${exportData.exceptions.length > exportData.actionable ? `, plus ${exportData.exceptions.length - exportData.actionable} not included` : ""}`} color={exportData.actionable ? "text-amber-600" : "text-gray-900"} />
             </div>
-          </div>
-        </Modal>
-      )}
-      {showInvoiceDetail && (
-        <Modal title={`Invoice lines — ${showInvoiceDetail.clientName}`} onClose={() => setShowInvoiceDetail(null)} wide>
-          <div className="space-y-3">
+
+            {exportData.exceptions.length > 0 && (
+              <div className="bg-amber-50 border border-amber-100 rounded-xl p-3 max-h-40 overflow-y-auto">
+                {exportData.exceptions.map((e, i) => (
+                  <p key={i} className="text-xs text-amber-800">
+                    <strong>{e.type}:</strong> {e.customer}, {e.detail}
+                  </p>
+                ))}
+              </div>
+            )}
+
             <p className="text-xs text-gray-400">
-              Month: {showInvoiceDetail.month} · {showInvoiceDetail.multiDept ? "Separate QBO lines per department" : "Single QBO line"}
+              Product/Service, Class, Terms and Description come from each customer's last invoice in the QBO actuals, with month references rolled forward. Edit any cell and the change is remembered for next month. Blank cells in amber need a value before importing.
             </p>
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-xs text-gray-400 border-b border-gray-100">
-                  <th className="py-2 text-left">Service</th>
-                  <th className="py-2 text-left">Department</th>
-                  <th className="py-2 text-left">Lead</th>
-                  <th className="py-2 text-right">Amount</th>
-                </tr>
-              </thead>
-              <tbody>
-                {showInvoiceDetail.lines?.filter(line => (line.amount ?? line.amounts?.[showInvoiceDetail.monthCol] ?? 0) > 0).map((line, idx) => (
-                  <tr key={idx} className="border-b border-gray-50">
-                    <td className="py-2 text-gray-700">
-                      {line.service}
-                      {line.fromContract && <span className="ml-2 text-xs bg-blue-50 text-blue-600 px-2 py-0.5 rounded-full">contract</span>}
-                    </td>
-                    <td className="py-2">
-                      <span className="bg-gray-100 text-gray-500 text-xs px-2 py-0.5 rounded-full">{line.department}</span>
-                    </td>
-                    <td className="py-2 text-xs text-gray-500">{line.lead || "—"}</td>
-                    <td className="py-2 text-right font-medium text-gray-800">{fmt(line.amount ?? line.amounts?.[showInvoiceDetail.monthCol])}</td>
+            <div className="border border-gray-100 rounded-xl overflow-x-auto max-h-[45vh] overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white">
+                  <tr className="text-gray-400 border-b border-gray-100">
+                    <th className="px-3 py-2 text-left">No.</th>
+                    <th className="px-3 py-2 text-left">QBO customer</th>
+                    <th className="px-3 py-2 text-left">Terms</th>
+                    <th className="px-3 py-2 text-left">Product/Service</th>
+                    <th className="px-3 py-2 text-left">Description</th>
+                    <th className="px-3 py-2 text-left">Class</th>
+                    <th className="px-3 py-2 text-right">Amount</th>
                   </tr>
-                ))}
-              </tbody>
-              <tfoot>
-                <tr>
-                  <td colSpan={3} className="pt-3 text-sm font-medium text-gray-600">
-                    Total
-                  </td>
-                  <td className="pt-3 text-right font-semibold text-gray-900">{fmt(showInvoiceDetail.amount)}</td>
-                </tr>
-              </tfoot>
-            </table>
-            <button onClick={() => setShowInvoiceDetail(null)} className="w-full border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
-              Close
-            </button>
-          </div>
-        </Modal>
-      )}
-      {showApprove && (
-        <Modal title={`Review Invoice — ${showApprove.clientName}`} onClose={() => setShowApprove(null)}>
-          <div className="space-y-4">
-            <div className="bg-gray-50 rounded-xl p-4 text-sm space-y-2">
-              <div className="flex justify-between">
-                <span className="text-gray-500">Client</span>
-                <span className="font-medium">{showApprove.clientName}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-500">Lead</span>
-                <span>{showApprove.lead || "—"}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-500">Previous month</span>
-                <span>{fmt(showApprove.lastAmount)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-500">Projected month</span>
-                <span className="font-semibold text-gray-900">{fmt(showApprove.amount)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-500">QBO lines</span>
-                <span>{showApprove.multiDept ? `${[...new Set(showApprove.lines?.map(line => line.department))].filter(Boolean).length} separate lines` : "1 line"}</span>
-              </div>
+                </thead>
+                <tbody>
+                  {exportData.invoices.map(inv =>
+                    inv.lines.map((l, idx) => (
+                      <tr key={`${inv.key}-${l.lineId}`} className={`border-b border-gray-50 align-top ${idx === 0 ? "border-t border-gray-100" : ""}`}>
+                        <td className="px-3 py-1.5 text-gray-500">{idx === 0 ? inv.no || "auto" : ""}</td>
+                        <td className="px-3 py-1.5">
+                          {idx === 0 && (
+                            <div>
+                              <EditableText value={inv.customer} onSave={v => saveCustomerField(inv.key, "customer", v)} className="w-56" />
+                              {inv.newCustomer && <div className="text-amber-600 mt-0.5">New in QBO, confirm the name</div>}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-3 py-1.5">{idx === 0 && <EditableText value={inv.terms} onSave={v => saveCustomerField(inv.key, "terms", v)} placeholder="Customer default" />}</td>
+                        <td className={`px-3 py-1.5 ${l.item ? "" : "bg-amber-50"}`}>
+                          <EditableText value={l.item} onSave={v => saveLineField(l.lineId, "item", v)} placeholder={l.service ? `Set item for ${l.service}` : "Set item"} className="w-48" />
+                        </td>
+                        <td className="px-3 py-1.5 max-w-xs">
+                          <EditableText value={l.description} onSave={v => saveLineField(l.lineId, "description", v)} className="w-72" />
+                        </td>
+                        <td className={`px-3 py-1.5 ${l.class || !exportData.usesClass ? "" : "bg-amber-50"}`}>
+                          <EditableText value={l.class} onSave={v => saveLineField(l.lineId, "class", v)} placeholder={l.department ? `Set class (${l.department})` : "Set class"} className="w-40" />
+                        </td>
+                        <td className="px-3 py-1.5 text-right font-medium text-gray-800 whitespace-nowrap">{fmt(l.amount)}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+              {exportData.invoices.length === 0 && <div className="px-6 py-8 text-center text-gray-300 text-sm">No invoices match this filter. Approve invoices first or change Include.</div>}
             </div>
-            <div>
-              <label className="text-xs text-gray-500 mb-1 block">Approver</label>
-              <select value={showApprove.approver} onChange={e => setShowApprove(prev => ({ ...prev, approver: e.target.value }))} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none">
-                {(approvers.length ? approvers : ["—"]).map(approver => (
-                  <option key={approver}>{approver}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="text-xs text-gray-500 mb-1 block">Comment (optional)</label>
-              <textarea value={approveComment} onChange={e => setApproveComment(e.target.value)} rows={2} className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm outline-none resize-none focus:border-gray-400" />
-            </div>
-            <div className="flex gap-3">
-              <button onClick={() => approveInvoice("rejected")} className="flex-1 border border-red-200 text-red-600 rounded-lg py-2 text-sm hover:bg-red-50">
-                Reject
+
+            <div className="flex gap-3 flex-wrap justify-end">
+              <button onClick={() => setShowExport(false)} className="border border-gray-200 text-gray-600 rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+                Close
               </button>
-              <button onClick={() => approveInvoice("see notes")} className="flex-1 border border-orange-200 text-orange-600 rounded-lg py-2 text-sm hover:bg-orange-50">
-                See Notes
+              <button onClick={() => exportReviewWorkbook(exportData, bm, data)} className="border border-gray-200 text-gray-700 rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+                Download review workbook (xlsx)
               </button>
-              <button onClick={() => approveInvoice("approved")} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700">
-                Approve
+              <button onClick={() => exportCsv(exportData, M)} disabled={!exportData.invoices.length} className="bg-emerald-600 text-white rounded-lg px-4 py-2 text-sm hover:bg-emerald-700 disabled:opacity-40">
+                Download QBO import CSV
+              </button>
+              <button onClick={markExportedAsSent} disabled={!exportData.invoices.length || isClosed} className="bg-purple-600 text-white rounded-lg px-4 py-2 text-sm hover:bg-purple-700 disabled:opacity-40">
+                Mark these as exported
               </button>
             </div>
+            <p className="text-xs text-gray-400 text-right">QBO's native invoice import may not map the Class column. SaaSAnt or Transaction Pro do.</p>
           </div>
         </Modal>
       )}
