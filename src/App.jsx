@@ -690,6 +690,12 @@ function Card({ title, subtitle, right, children, tone }) {
 }
 
 // ---------- Billing model ----------
+// Departments left out of this dashboard, both from the financial model and from QBO actuals
+const EXCLUDED_DEPARTMENTS = [/fiat finance/i];
+function isExcludedDept(value) {
+  const v = String(value || "");
+  return EXCLUDED_DEPARTMENTS.some(re => re.test(v));
+}
 function lineAmountFor(line, ym, overrides) {
   const ov = overrides?.[ym]?.[line.id];
   if (ov?.removed) return 0;
@@ -699,7 +705,12 @@ function lineAmountFor(line, ym, overrides) {
 function buildBillingModel(data) {
   const M = data.billingMonth;
   const P = ymAdd(M, -1);
-  const forecastLines = data.forecast.lines || [];
+  const allForecastLines = data.forecast.lines || [];
+  // clients whose model lines are all in an excluded department (used to drop their QBO actuals when QBO has no class)
+  const deptsByClient = {};
+  allForecastLines.forEach(l => (deptsByClient[clientKey(l.clientName)] = deptsByClient[clientKey(l.clientName)] || []).push(l.department));
+  const excludedClients = new Set(Object.entries(deptsByClient).filter(([, ds]) => ds.every(isExcludedDept)).map(([k]) => k));
+  const forecastLines = allForecastLines.filter(l => !isExcludedDept(l.department));
   const modelNames = {};
   forecastLines.forEach(l => {
     const k = clientKey(l.clientName);
@@ -726,7 +737,7 @@ function buildBillingModel(data) {
     if (mapped) return mapped;
     return autoKey(qboName).key;
   };
-  const actualLines = data.actuals.lines || [];
+  const actualLines = (data.actuals.lines || []).filter(l => !isExcludedDept(l.class) && !excludedClients.has(resolveCustomer(l.customer)));
   const actualMonths = new Set(actualLines.map(l => l.ym));
   const actualsByYm = {};
   const actualLinesByClient = {};
@@ -764,7 +775,7 @@ function buildBillingModel(data) {
     c.lines.push({ ...line, modelAmount, amount, edited: !!ov && !ov.removed, removed: !!ov?.removed, manual: false });
     if (amount && line.department) c.departments.add(line.department);
   });
-  (data.manualLines?.[M] || []).forEach(line => {
+  (data.manualLines?.[M] || []).filter(line => !isExcludedDept(line.department)).forEach(line => {
     const key = clientKey(line.clientName);
     const c = ensure(key, line.clientName);
     c.lines.push({ ...line, modelAmount: 0, amount: line.amount, manual: true });
@@ -815,7 +826,7 @@ function buildBillingModel(data) {
   forecastLines.forEach(l => Object.keys(l.amounts || {}).forEach(k => monthSet.add(k)));
   actualMonths.forEach(m => monthSet.add(m));
   const monthOptions = [...monthSet].sort();
-  const modelTotalForM = forecastLines.reduce((s, l) => s + (l.amounts?.[M] || 0), 0);
+  const modelTotalForM = allForecastLines.reduce((s, l) => s + (l.amounts?.[M] || 0), 0);
   return {
     M,
     P,
@@ -1016,6 +1027,8 @@ export default function App() {
   const [filterLead, setFilterLead] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
+  const [closeAnyway, setCloseAnyway] = useState(false);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [selectedClosed, setSelectedClosed] = useState("");
   const [showExport, setShowExport] = useState(false);
   const [exportOpts, setExportOpts] = useState({ scope: "approved", invoiceDate: "", autoNumber: false, startNo: "" });
@@ -1131,8 +1144,9 @@ export default function App() {
   );
   const pendingCount = approvalBase.filter(r => r.status === "pending").length;
   const approvedCount = approvalBase.filter(r => r.status === "approved" || r.status === "sent").length;
-  const notApprovedCount = approvalBase.filter(r => !["approved", "sent"].includes(r.status)).length;
-  const canClose = approvalBase.length > 0 && notApprovedCount === 0;
+  // Rejected invoices are a decision (not billed), so only pending and see notes hold the close
+  const blockers = approvalBase.filter(r => r.status === "pending" || r.status === "see notes");
+  const canClose = approvalBase.length > 0;
   const statusByKey = Object.fromEntries(approvalBase.map(r => [r.key, r.status]));
 
   function saveApproval(key, patch) {
@@ -1149,19 +1163,27 @@ export default function App() {
     setApproveComment(r.comment || "");
     setApproveApprover(r.approver || "");
   }
+  // Deletes every approval of the selected month and, if it was closed, its closed month record
   function resetApprovals() {
-    commit(d => setIn(d, ["approvalHistory", M], undefined));
+    commit(d => ({ ...setIn(d, ["approvalHistory", M], undefined), closedMonths: (d.closedMonths || []).filter(m => m.monthKey !== M) }));
+    setShowClearConfirm(false);
+    setNotice(`All ${ymLabel(M)} approvals were deleted.`);
+  }
+  function reopenMonth() {
+    commit(d => ({ ...d, closedMonths: (d.closedMonths || []).filter(m => m.monthKey !== M) }));
+    setNotice(`${ymLabel(M)} reopened. Approvals were kept.`);
   }
   function closeMonth() {
-    if (!canClose) return;
+    if (!canClose || (blockers.length && !closeAnyway)) return;
+    const billed = approvalBase.filter(r => r.status !== "rejected");
     const record = {
       monthKey: M,
       monthLabel: ymLabel(M),
       previousMonthKey: P,
       previousMonthLabel: ymLabel(P),
       closedAt: new Date().toISOString(),
-      total: round2(approvalBase.reduce((s, r) => s + r.amount, 0)),
-      invoiceCount: approvalBase.length,
+      total: round2(billed.reduce((s, r) => s + r.amount, 0)),
+      invoiceCount: billed.length,
       approvedCount: approvalBase.filter(r => r.status === "approved").length,
       sentCount: approvalBase.filter(r => r.status === "sent").length,
       invoices: approvalBase.map(r => ({
@@ -1180,6 +1202,8 @@ export default function App() {
     commit(d => ({ ...d, closedMonths: [...(d.closedMonths || []).filter(m => m.monthKey !== M), record], billingMonth: next }));
     setSelectedClosed(M);
     setShowCloseConfirm(false);
+    setCloseAnyway(false);
+    setNotice(`${ymLabel(M)} closed. Billing month moved to ${ymLabel(next)}.`);
   }
 
   // ---------- billing edits ----------
@@ -1706,18 +1730,21 @@ export default function App() {
                     <option value="amount">Billing amount</option>
                     <option value="variance">Largest variance</option>
                   </select>
-                  {!isClosed && (
-                    <button onClick={resetApprovals} className="px-3 py-2 rounded-lg text-xs font-medium border border-red-200 text-red-600 hover:bg-red-50">
-                      Clear approvals for this month
-                    </button>
-                  )}
+                  <button onClick={() => setShowClearConfirm(true)} className="px-3 py-2 rounded-lg text-xs font-medium border border-red-200 text-red-600 hover:bg-red-50">
+                    Clear approvals for this month
+                  </button>
                   {isClosed ? (
-                    <span className="px-3 py-2 rounded-lg text-xs font-medium bg-gray-100 text-gray-400 border border-gray-200">🔒 Month closed</span>
+                    <button onClick={reopenMonth} className="px-3 py-2 rounded-lg text-xs font-medium border border-gray-200 text-gray-600 hover:bg-gray-50">
+                      🔓 Reopen month
+                    </button>
                   ) : (
                     <button
-                      onClick={() => setShowCloseConfirm(true)}
+                      onClick={() => {
+                        setCloseAnyway(false);
+                        setShowCloseConfirm(true);
+                      }}
                       disabled={!canClose}
-                      title={!approvalBase.length ? "No invoices to close" : !canClose ? `${notApprovedCount} invoice${notApprovedCount !== 1 ? "s are" : " is"} not approved yet` : `Close ${ymLabel(M)} and move to ${ymLabel(ymAdd(M, 1))}`}
+                      title={!approvalBase.length ? `No billing for ${ymLabel(M)}` : `Close ${ymLabel(M)} and move to ${ymLabel(ymAdd(M, 1))}`}
                       className="px-3 py-2 rounded-lg text-xs font-medium bg-gray-900 text-white hover:bg-gray-700 disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                       Close Month →
@@ -1758,7 +1785,23 @@ export default function App() {
             </div>
             {isClosed && (
               <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-500">
-                🔒 <strong>{ymLabel(M)}</strong> is closed. Approvals are locked.
+                🔒 <strong>{ymLabel(M)}</strong> is closed. Approvals are locked. Use Reopen month to make changes.
+              </div>
+            )}
+            {!isClosed && blockers.length > 0 && (
+              <div className="bg-amber-50 border border-amber-100 rounded-xl px-4 py-3 text-xs text-amber-800 flex items-center justify-between gap-3 flex-wrap">
+                <span>
+                  {blockers.length} invoice{blockers.length !== 1 ? "s still need" : " still needs"} a decision before closing {ymLabel(M)}: {blockers.filter(r => r.status === "pending").length} pending, {blockers.filter(r => r.status === "see notes").length} see notes. Rejected invoices do not hold the close.
+                </span>
+                <button
+                  onClick={() => {
+                    setFilterLead("all");
+                    setFilterStatus(blockers.some(r => r.status === "pending") ? "pending" : "see notes");
+                  }}
+                  className="text-amber-700 underline whitespace-nowrap"
+                >
+                  Show them
+                </button>
               </div>
             )}
             <div className="bg-white rounded-2xl border border-gray-100 overflow-x-auto">
@@ -2226,14 +2269,50 @@ export default function App() {
         <Modal title="Close Month" onClose={() => setShowCloseConfirm(false)}>
           <div className="space-y-4">
             <p className="text-sm text-gray-600">
-              Close <strong>{ymLabel(M)}</strong>? All {approvalBase.length} approvals will be locked and a snapshot of the billed invoices will be saved. The billing month will move to <strong>{ymLabel(ymAdd(M, 1))}</strong>.
+              Close <strong>{ymLabel(M)}</strong>? Approvals will be locked and a snapshot of the billed invoices will be saved. The billing month will move to <strong>{ymLabel(ymAdd(M, 1))}</strong>. You can reopen it later if needed.
             </p>
+            {blockers.length > 0 && (
+              <div className="bg-amber-50 border border-amber-100 rounded-xl p-3 space-y-2">
+                <p className="text-xs font-medium text-amber-800">{blockers.length} invoice{blockers.length !== 1 ? "s have" : " has"} no decision yet:</p>
+                <div className="max-h-32 overflow-y-auto space-y-0.5">
+                  {blockers.map(r => (
+                    <p key={r.key} className="text-xs text-amber-800">
+                      {r.name}, {fmt(r.amount)}, {r.status}
+                      {r.lead ? `, ${r.lead}` : ""}
+                    </p>
+                  ))}
+                </div>
+                <label className="flex items-center gap-2 text-xs text-amber-900 pt-1">
+                  <input type="checkbox" checked={closeAnyway} onChange={e => setCloseAnyway(e.target.checked)} />
+                  Close anyway and save them with their current status
+                </label>
+              </div>
+            )}
             <div className="flex gap-3 pt-2">
               <button onClick={() => setShowCloseConfirm(false)} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
                 Cancel
               </button>
-              <button onClick={closeMonth} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700">
+              <button onClick={closeMonth} disabled={blockers.length > 0 && !closeAnyway} className="flex-1 bg-gray-900 text-white rounded-lg py-2 text-sm hover:bg-gray-700 disabled:opacity-40">
                 Close Month
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      {showClearConfirm && (
+        <Modal title={`Clear ${ymLabel(M)} approvals`} onClose={() => setShowClearConfirm(false)}>
+          <div className="space-y-4">
+            <p className="text-sm text-gray-600">
+              This deletes every approval, comment and export mark for <strong>{ymLabel(M)}</strong>
+              {isClosed ? ", and removes the month from Closed Months" : ""}. Billing amounts and edits are not affected. This cannot be undone.
+            </p>
+            <div className="flex gap-3 pt-2">
+              <button onClick={() => setShowClearConfirm(false)} className="flex-1 border border-gray-200 text-gray-600 rounded-lg py-2 text-sm hover:bg-gray-50">
+                Cancel
+              </button>
+              <button onClick={resetApprovals} className="flex-1 bg-red-600 text-white rounded-lg py-2 text-sm hover:bg-red-700">
+                Delete {ymLabel(M)} approvals
               </button>
             </div>
           </div>
